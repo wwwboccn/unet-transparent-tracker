@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unet-transparent-tracker"
+version = "2.3.0"
+description = "Universal shape-agnostic U-Net real-time tracker for moving & spinning transparent objects with global hotkeys and automatic mouse locking."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.21.0",
+    "opencv-python>=4.5.0",
+    "Pillow>=9.0.0",
+    "mss>=6.1.0",
+]
+
+[project.scripts]
+unet-tracker = "unet_tracker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

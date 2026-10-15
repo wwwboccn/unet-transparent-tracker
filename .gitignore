@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# User runtime configuration & local recordings
+tracker_hotkey_config.json
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.csv
+
+# Keep assets images
+!assets/*.jpg
+!assets/*.png
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

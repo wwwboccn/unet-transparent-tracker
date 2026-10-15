@@ -1,0 +1,16 @@
+{
+  "hk_toggle_run": "F8",
+  "hk_toggle_mouse": "F9",
+  "hk_panic_stop": "F10",
+  "perf_mode": "turbo",
+  "sync_wall_clock": true,
+  "mouse_follow_enabled": false,
+  "mouse_only_transparent": false,
+  "mouse_driver_mode": "setcursorpos",
+  "mouse_lead_ms": 15.0,
+  "mouse_offset_x": 0,
+  "mouse_offset_y": 0,
+  "ema_alpha": 0.54,
+  "gate_radius_half": 44.0,
+  "max_step_px": 22.0
+}
