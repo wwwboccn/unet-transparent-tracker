@@ -25,6 +25,38 @@
 | **`1000012887.mp4` (60FPS 实测)** | 狐狸头 + 底部状态栏 | `746×536 @ 60FPS` | 681 帧 | **100.00%** (681/681) | **5.34** | **8.0s 穿心直达右下角** | `(601.5, 360.5)` |
 | **`1000012865.mp4` (带绿圈光标)** | 狐狸头 + 绿色辅助光标 | `720×480 @ 30FPS` | 335 帧 | **100.00%** (335/335) | **5.28** | **33.52 px** *(自动剥离光标)* | `(378.9, 406.4)` |
 
+## ⚡ RTX 3060 (12GB) CUDA 显卡加速配置说明 (V2.7 新增)
+
+针对配备 **NVIDIA GeForce RTX 3060 (12GB)** 等独立显卡的机器，V2.7 内置了 `CudaAcceleratorBackend` 双引擎硬件加速管理器（自动支持 **PyTorch CUDA `torch.cuda`** 与 **OpenCV CUDA `cv2.cuda`**）：
+
+### 1. 安装 PyTorch CUDA 12.1 环境（推荐，Windows 下最省事）
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+```
+
+### 2. 指定使用 RTX 3060 (`cuda` / `cuda:0`) 的三种方式
+- **方式 A：命令行参数直接指定 `--device cuda`**：
+  ```bash
+  # 启动 GUI 并强制启用第 0 块 CUDA 显卡 (RTX 3060 12G)
+  python unet_universal_tracker_v2.py --gui --device cuda --gpu-id 0
+
+  # 命令行使用 RTX 3060 CUDA 批量测试样本文件夹
+  python unet_universal_tracker_v2.py --video ./hs_samples/ --device cuda
+  ```
+- **方式 B：Windows GUI 面板一键切换**：
+  在右侧控制面板 **“⏱️ 时钟同步与显卡硬件加速”** 区域直接勾选 **`🚀 CUDA(3060)`**，状态栏会实时显示 `CUDA:0 NVIDIA GeForce RTX 3060 (12GB)`，且配置自动持久化保存在 `tracker_hotkey_config.json` 中。
+- **方式 C：配置文件 `tracker_hotkey_config.json` 指定**：
+  ```json
+  {
+    "hk_toggle_run": "F8",
+    "hk_toggle_mouse": "F9",
+    "hk_panic_stop": "F10",
+    "compute_device": "cuda",
+    "gpu_id": 0
+  }
+  ```
+
 ## 🚀 快速开始 (Quick Start)
 
 ```bash

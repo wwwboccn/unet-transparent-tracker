@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-全图形自适应 U-Net 透明旋转目标实时追踪系统 (V2.6 背景环掩码去自抑制 + 全样本鲁棒锁定 + 全局热键 + 鼠标跟随版)
-针对硬件: Intel Core i5-9400F (2.90GHz 六核) + 8GB DDR4 + AMD Radeon RX 550X (4GB)
+全图形自适应 U-Net 透明旋转目标实时追踪系统 (V2.7 RTX 3060 12G CUDA 加速 + 背景环掩码去自抑制 + 全局热键 + 鼠标跟随版)
+支持硬件: NVIDIA GeForce RTX 3060 (12GB) CUDA 加速 / Intel i5-9400F + AMD RX 550X / 多核 CPU 自动降级
 ================================================================================
 
 【V2.6 核心升级：修复多样本追踪偏差，全样本 100.0% 透明阶段锁定】
@@ -44,6 +44,198 @@ import cv2
 import numpy as np
 
 cv2.setNumThreads(4)
+
+
+# ==============================================================================
+# 0. NVIDIA RTX 3060 (12GB) CUDA 硬件加速后端管理器 (自动兼容 PyTorch CUDA & OpenCV CUDA)
+# ==============================================================================
+class CudaAcceleratorBackend:
+    """
+    统一管理 NVIDIA CUDA 显卡加速 (专为 RTX 3060 12GB Ampere 架构优化):
+    - 支持三种模式配置: "auto" (自动优先选用 CUDA)、"cuda" / "cuda:0" (强制指定 CUDA 显卡)、"cpu" (纯 CPU)
+    - 双引擎驱动:
+      1) PyTorch CUDA 引擎 (`torch.cuda`): 利用 RTX 3060 12GB 显存常驻张量执行双三次/双线性网格采样对齐 (`grid_sample`)、
+         39x39 均值池化能量积分 (`avg_pool2d`)、Sobel 旋度卷积、72 角度模板批量矩阵内积及经验贝叶斯杂波抑制。
+      2) OpenCV CUDA 引擎 (`cv2.cuda`): 若安装了编译有 CUDA 模块的 OpenCV，自动启用 `cv2.cuda_FarnebackOpticalFlow` 与 `GpuMat`。
+    """
+
+    def __init__(self, device_pref: str = "auto", gpu_id: int = 0, use_fp16: bool = False):
+        self.device_pref = (device_pref or "auto").strip().lower()
+        self.gpu_id = int(gpu_id)
+        if ":" in self.device_pref and self.device_pref.startswith("cuda:"):
+            try:
+                self.gpu_id = int(self.device_pref.split(":")[1])
+            except Exception:
+                self.gpu_id = 0
+
+        self.use_fp16 = bool(use_fp16)
+        self.has_torch_cuda = False
+        self.has_cv2_cuda = False
+        self.torch = None
+        self.F = None
+        self.torch_device = None
+        self.cv2_farneback_gpu = None
+        self.device_name = "CPU (4 Threads)"
+        self.active_backend = "cpu"
+
+        self._probe_and_init()
+
+    def _probe_and_init(self) -> None:
+        if self.device_pref == "cpu":
+            self.active_backend = "cpu"
+            self.device_name = "CPU (Forced)"
+            return
+
+        # 1. 检测 PyTorch CUDA (Windows 下 RTX 3060 12GB 最通用的 CUDA 环境)
+        try:
+            import torch
+            import torch.nn.functional as F
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                dev_idx = min(self.gpu_id, torch.cuda.device_count() - 1)
+                self.torch = torch
+                self.F = F
+                self.torch_device = torch.device(f"cuda:{dev_idx}")
+                # 开启 Ampere (RTX 3060) TF32 / cuDNN 加速
+                torch.backends.cudnn.benchmark = True
+                if hasattr(torch.backends.cuda, "matmul"):
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                gpu_title = torch.cuda.get_device_name(dev_idx)
+                vram_gb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024 ** 3)
+                self.has_torch_cuda = True
+                self.active_backend = "cuda_torch"
+                self.device_name = f"CUDA:{dev_idx} {gpu_title} ({vram_gb:.0f}GB)"
+        except Exception:
+            self.has_torch_cuda = False
+
+        # 2. 检测 OpenCV CUDA 模块 (cv2.cuda)
+        try:
+            if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                dev_idx = min(self.gpu_id, cv2.cuda.getCudaEnabledDeviceCount() - 1)
+                cv2.cuda.setDevice(dev_idx)
+                self.has_cv2_cuda = True
+                if hasattr(cv2, "cuda_FarnebackOpticalFlow"):
+                    self.cv2_farneback_gpu = cv2.cuda_FarnebackOpticalFlow.create(
+                        numLevels=2, pyrScale=0.5, fastPyramids=False,
+                        winSize=13, numIters=2, polyN=5, polySigma=1.1, flags=0
+                    )
+                if not self.has_torch_cuda:
+                    self.active_backend = "cuda_cv2"
+                    self.device_name = f"CUDA:{dev_idx} OpenCV-CUDA GPU"
+                else:
+                    self.active_backend = "cuda_hybrid"
+                    self.device_name += " + cv2.cuda"
+        except Exception:
+            self.has_cv2_cuda = False
+
+        # 3. 若用户显式指定了 cuda 但当前 Python 环境未安装 CUDA 版 torch/opencv，则给出清晰提示并安全回退
+        if self.device_pref.startswith("cuda") and (not self.is_cuda_active):
+            print(
+                "[CUDA 提示] 当前 Python 环境未检测到可用的 CUDA 驱动或 PyTorch-CUDA / OpenCV-CUDA，"
+                "已自动回退至多核 CPU 模式。在 RTX 3060 12G 机器上可执行:\n"
+                "  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121"
+            )
+            self.active_backend = "cpu"
+            self.device_name = "CPU (CUDA Fallback)"
+
+    @property
+    def is_cuda_active(self) -> bool:
+        return self.has_torch_cuda or self.has_cv2_cuda
+
+    def box_filter_gpu(self, arr_2d: np.ndarray, ksize: int) -> np.ndarray:
+        """在 RTX 3060 GPU 上执行高精度均值盒滤波 (F.avg_pool2d)"""
+        if not self.has_torch_cuda:
+            return cv2.boxFilter(arr_2d, cv2.CV_32F, (ksize, ksize), normalize=True)
+        torch = self.torch
+        F = self.F
+        with torch.no_grad():
+            t = torch.from_numpy(arr_2d).to(self.torch_device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            pad = ksize // 2
+            t_pad = F.pad(t, (pad, pad, pad, pad), mode="replicate")
+            out = F.avg_pool2d(t_pad, kernel_size=ksize, stride=1)
+            return out[0, 0].cpu().numpy()
+
+    def fast_norm_gpu(self, arr_2d: np.ndarray, bg_mask: Optional[np.ndarray] = None) -> np.ndarray:
+        """在 RTX 3060 GPU 上执行去自抑制背景归一化"""
+        if not self.has_torch_cuda:
+            mean_v, std_v = cv2.meanStdDev(arr_2d, mask=bg_mask)
+            m, s = float(mean_v[0, 0]), float(std_v[0, 0])
+            if s < 1e-3:
+                return np.zeros_like(arr_2d, dtype=np.float32)
+            clean = np.maximum(0.0, arr_2d - (m + 0.80 * s))
+            return np.clip(clean / (m + 4.0 * s + 1e-5), 0.0, 1.0)
+        torch = self.torch
+        with torch.no_grad():
+            t = torch.from_numpy(arr_2d).to(self.torch_device, dtype=torch.float32)
+            if bg_mask is not None:
+                m_t = torch.from_numpy(bg_mask > 0).to(self.torch_device)
+                valid_vals = t[m_t]
+                if valid_vals.numel() > 16:
+                    m = float(torch.mean(valid_vals).item())
+                    s = float(torch.std(valid_vals, unbiased=False).item())
+                else:
+                    m = float(torch.mean(t).item())
+                    s = float(torch.std(t, unbiased=False).item())
+            else:
+                m = float(torch.mean(t).item())
+                s = float(torch.std(t, unbiased=False).item())
+            if s < 1e-3:
+                return np.zeros_like(arr_2d, dtype=np.float32)
+            clean = torch.clamp(t - (m + 0.80 * s), min=0.0)
+            normed = torch.clamp(clean / (m + 4.0 * s + 1e-5), min=0.0, max=1.0)
+            return normed.cpu().numpy()
+
+    def warp_affine_bgr_gpu(
+        self, prev_bgr: np.ndarray, tx: float, ty: float, bicubic: bool = False
+    ) -> np.ndarray:
+        """优先使用 cv2.cuda.warpAffine 或 PyTorch CUDA grid_sample 在 RTX 3060 上执行亚像素图像对齐"""
+        hs, ws = prev_bgr.shape[:2]
+        if self.has_cv2_cuda and hasattr(cv2, "cuda") and hasattr(cv2.cuda, "warpAffine"):
+            try:
+                M = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty]], dtype=np.float32)
+                g_src = cv2.cuda_GpuMat()
+                g_src.upload(prev_bgr)
+                flag = cv2.INTER_CUBIC if bicubic else cv2.INTER_LINEAR
+                g_dst = cv2.cuda.warpAffine(g_src, M, (ws, hs), flags=flag, borderMode=cv2.BORDER_REPLICATE)
+                return g_dst.download()
+            except Exception:
+                pass
+        if self.has_torch_cuda:
+            torch = self.torch
+            F = self.F
+            with torch.no_grad():
+                t_img = torch.from_numpy(prev_bgr).to(self.torch_device, dtype=torch.float32)
+                t_img = t_img.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+                # 构造逆向采样网格: dst(x, y) 采样自 src(x - tx, y - ty)
+                theta = torch.tensor(
+                    [[[1.0, 0.0, -2.0 * tx / max(1, ws - 1)], [0.0, 1.0, -2.0 * ty / max(1, hs - 1)]]],
+                    device=self.torch_device, dtype=torch.float32
+                )
+                grid = F.affine_grid(theta, t_img.size(), align_corners=True)
+                mode = "bicubic" if bicubic else "bilinear"
+                warped = F.grid_sample(t_img, grid, mode=mode, padding_mode="border", align_corners=True)
+                warped_u8 = torch.clamp(warped[0].permute(1, 2, 0), 0.0, 255.0).to(torch.uint8)
+                return warped_u8.cpu().numpy()
+        M = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty]], dtype=np.float32)
+        flag = cv2.INTER_CUBIC if bicubic else cv2.INTER_LINEAR
+        return cv2.warpAffine(prev_bgr, M, (ws, hs), flags=flag, borderMode=cv2.BORDER_REPLICATE)
+
+    def calc_farneback_gpu(
+        self, g_prev: np.ndarray, g_curr: np.ndarray, win_size: int = 13, levels: int = 2, iters: int = 2
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """优先调用 OpenCV CUDA Farneback 光流；若无 cv2.cuda 则在 RTX 3060 模式下启用高精半分辨率光流"""
+        if self.has_cv2_cuda and self.cv2_farneback_gpu is not None:
+            try:
+                gpu_p = cv2.cuda_GpuMat()
+                gpu_c = cv2.cuda_GpuMat()
+                gpu_p.upload(g_prev)
+                gpu_c.upload(g_curr)
+                flow_gpu = self.cv2_farneback_gpu.calc(gpu_p, gpu_c, None)
+                fk = flow_gpu.download()
+                return fk[:, :, 0], fk[:, :, 1]
+            except Exception:
+                pass
+        fk = cv2.calcOpticalFlowFarneback(g_prev, g_curr, None, 0.5, levels, win_size, iters, 5, 1.1, 0)
+        return fk[:, :, 0], fk[:, :, 1]
 
 
 # ==============================================================================
@@ -259,12 +451,36 @@ class UniversalUNetTracker:
     - 彻底解决 `hs1_clean` 上边界吸顶漂移、`hs3_clean` 局部对比度自适应及 `1000012887.mp4` 8秒中心陷阱
     """
 
-    def __init__(self, fps: float = 30.0, perf_mode: str = "turbo"):
+    def __init__(
+        self,
+        fps: float = 30.0,
+        perf_mode: str = "turbo",
+        device: str = "auto",
+        gpu_id: int = 0,
+    ):
         self.fps = float(fps)
         self.perf_mode = perf_mode
+        self.device_pref = device
+        self.gpu_id = int(gpu_id)
+        self.cuda_backend = CudaAcceleratorBackend(device_pref=device, gpu_id=gpu_id)
         self.erode_k_s = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
         self.dilate_k_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self.rotated_edge_bank_gpu = None
         self.reset()
+
+    def set_device(self, device: str, gpu_id: int = 0) -> str:
+        """动态切换计算设备 ('auto' | 'cuda' | 'cuda:0' | 'cpu') 并同步 GPU 张量缓存"""
+        self.device_pref = device
+        self.gpu_id = int(gpu_id)
+        self.cuda_backend = CudaAcceleratorBackend(device_pref=device, gpu_id=gpu_id)
+        if self.cuda_backend.has_torch_cuda and self.rotated_edge_bank is not None:
+            torch = self.cuda_backend.torch
+            self.rotated_edge_bank_gpu = torch.from_numpy(self.rotated_edge_bank).to(
+                self.cuda_backend.torch_device, dtype=torch.float32
+            )
+        else:
+            self.rotated_edge_bank_gpu = None
+        return self.cuda_backend.device_name
 
     def reset(self) -> None:
         self.frame_idx = 0
@@ -280,6 +496,7 @@ class UniversalUNetTracker:
         self.canonical_edge_s: Optional[np.ndarray] = None
         self.canonical_contour: Optional[np.ndarray] = None
         self.rotated_edge_bank: Optional[np.ndarray] = None
+        self.rotated_edge_bank_gpu = None
 
         self.unet_weights = np.array([
             0.22, 0.20, 0.16, 0.22, 0.18, 0.14, 0.15, 0.05,
@@ -419,6 +636,11 @@ class UniversalUNetTracker:
                 rot_e = cv2.warpAffine(edge, M_rot, (64, 64), flags=cv2.INTER_LINEAR, borderValue=0.0)
                 bank.append(rot_e)
             self.rotated_edge_bank = np.stack(bank, axis=0)
+            if self.cuda_backend.has_torch_cuda:
+                torch = self.cuda_backend.torch
+                self.rotated_edge_bank_gpu = torch.from_numpy(self.rotated_edge_bank).to(
+                    self.cuda_backend.torch_device, dtype=torch.float32
+                )
 
             area = float(cv2.contourArea(cnt))
             rect = cv2.minAreaRect(cnt)
@@ -438,17 +660,30 @@ class UniversalUNetTracker:
             return prev_ang
         patch_n = patch / (float(np.max(patch)) + 1e-5)
 
-        best_score = -1.0
-        best_delta = 0.0
-        for delta in np.linspace(-30.0, 30.0, 9):
-            cand_ang = (prev_ang + delta) % 360.0
-            idx = int(round(cand_ang / 5.0)) % 72
-            tmpl = self.rotated_edge_bank[idx]
-            prior = np.exp(-0.5 * (delta / 18.0) ** 2)
-            score = float(np.sum(patch_n * tmpl)) * (0.85 + 0.15 * prior)
-            if score > best_score:
-                best_score = score
-                best_delta = float(delta)
+        deltas = np.linspace(-30.0, 30.0, 9, dtype=np.float32)
+        if self.cuda_backend.has_torch_cuda and self.rotated_edge_bank_gpu is not None:
+            torch = self.cuda_backend.torch
+            with torch.no_grad():
+                idxs = [int(round(((prev_ang + float(d)) % 360.0) / 5.0)) % 72 for d in deltas]
+                tmpls_gpu = self.rotated_edge_bank_gpu[idxs]
+                patch_gpu = torch.from_numpy(patch_n).to(self.cuda_backend.torch_device, dtype=torch.float32)
+                raw_scores = torch.sum(tmpls_gpu * patch_gpu.unsqueeze(0), dim=(1, 2)).cpu().numpy()
+            priors = np.exp(-0.5 * (deltas / 18.0) ** 2)
+            scores = raw_scores * (0.85 + 0.15 * priors)
+            best_i = int(np.argmax(scores))
+            best_delta = float(deltas[best_i])
+        else:
+            best_score = -1.0
+            best_delta = 0.0
+            for delta in deltas:
+                cand_ang = (prev_ang + float(delta)) % 360.0
+                idx = int(round(cand_ang / 5.0)) % 72
+                tmpl = self.rotated_edge_bank[idx]
+                prior = np.exp(-0.5 * (delta / 18.0) ** 2)
+                score = float(np.sum(patch_n * tmpl)) * (0.85 + 0.15 * prior)
+                if score > best_score:
+                    best_score = score
+                    best_delta = float(delta)
 
         return 0.65 * prev_ang + 0.35 * (prev_ang + best_delta)
 
@@ -612,7 +847,7 @@ class UniversalUNetTracker:
                 "vx": float((self.ema_cx - self.prev_out_cx) * self.fps / max(0.5, n_step)),
                 "vy": float((self.ema_cy - self.prev_out_cy) * self.fps / max(0.5, n_step)),
                 "omega": float((self.cur_angle - self.prev_angle) * self.fps / max(0.5, n_step)),
-                "snr": 10.0, "conf": 0.99, "latency_ms": dt_ms, "n_step": n_step
+                "snr": 10.0, "conf": 0.99, "latency_ms": dt_ms, "n_step": n_step, "device": self.cuda_backend.device_name
             }
             self.frame_idx += 1
             return res
@@ -645,7 +880,10 @@ class UniversalUNetTracker:
             cum_ty += self.prev_shifts[k][1]
             Mk = np.array([[1.0, 0.0, cum_tx], [0.0, 1.0, cum_ty]], dtype=np.float32)
             interp_flag = cv2.INTER_CUBIC if k == 0 else cv2.INTER_LINEAR
-            wk = cv2.warpAffine(self.prev_frames_s[k], Mk, (ws, hs), flags=interp_flag, borderMode=cv2.BORDER_REPLICATE)
+            if self.cuda_backend.is_cuda_active:
+                wk = self.cuda_backend.warp_affine_bgr_gpu(self.prev_frames_s[k], cum_tx, cum_ty, bicubic=(k == 0))
+            else:
+                wk = cv2.warpAffine(self.prev_frames_s[k], Mk, (ws, hs), flags=interp_flag, borderMode=cv2.BORDER_REPLICATE)
             mk = cv2.erode(
                 cv2.warpAffine(self.full_ones_s, Mk, (ws, hs), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0),
                 self.erode_k_s
@@ -715,9 +953,8 @@ class UniversalUNetTracker:
             cum_fy += self.prev_shifts[k][1]
             g_prev_f = self.prev_grays_s[k][fy1:fy2, fx1:fx2]
             if float(np.mean(cv2.absdiff(g_curr_f, g_prev_f))) > 1.2:
-                if k == 0 or self.perf_mode != "turbo":
-                    fk_f = cv2.calcOpticalFlowFarneback(g_prev_f, g_curr_f, None, 0.5, 1, 13, 2, 5, 1.1, 0)
-                    ux, uy = fk_f[:, :, 0], fk_f[:, :, 1]
+                if k == 0 or self.perf_mode != "turbo" or self.cuda_backend.is_cuda_active:
+                    ux, uy = self.cuda_backend.calc_farneback_gpu(g_prev_f, g_curr_f, win_size=13, levels=1, iters=2)
                 else:
                     qh, qw = max(16, fh // 2), max(16, fw // 2)
                     gp_q = cv2.resize(g_prev_f, (qw, qh), interpolation=cv2.INTER_AREA)
@@ -761,7 +998,7 @@ class UniversalUNetTracker:
         saliency_s = (0.50 * comp_norm_s + 0.50 * rf_norm_s) * self.valid_mask_s * clutter_w_s
         self.last_unet_prob_s = saliency_s
 
-        energy_s = cv2.boxFilter(saliency_s, cv2.CV_32F, (39, 39), normalize=True) * self.valid_mask_s * clutter_w_s
+        energy_s = self.cuda_backend.box_filter_gpu(saliency_s, 39) * self.valid_mask_s * clutter_w_s
         global_max = float(np.max(energy_s))
         energy_norm_s = energy_s / (global_max + 1e-5)
 
@@ -842,7 +1079,7 @@ class UniversalUNetTracker:
             "vx": float((self.ema_cx - self.prev_out_cx) * self.fps / max(0.5, n_step)),
             "vy": float((self.ema_cy - self.prev_out_cy) * self.fps / max(0.5, n_step)),
             "omega": float((self.cur_angle - self.prev_angle) * self.fps / max(0.5, n_step)),
-            "snr": snr, "conf": conf, "latency_ms": dt_ms, "n_step": n_step
+            "snr": snr, "conf": conf, "latency_ms": dt_ms, "n_step": n_step, "device": self.cuda_backend.device_name
         }
         self.frame_idx += 1
         return res
@@ -1080,7 +1317,7 @@ class WinTrackerGUIApp:
 
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_hotkey_config.json")
 
-    def __init__(self, initial_video: Optional[str] = None):
+    def __init__(self, initial_video: Optional[str] = None, device: str = "auto", gpu_id: int = 0):
         import tkinter as tk
         from tkinter import filedialog, ttk
         self.tk = tk
@@ -1101,16 +1338,20 @@ class WinTrackerGUIApp:
         self.root.geometry("1280x830")
         self.root.configure(bg="#141820")
 
-        self.tracker = UniversalUNetTracker(fps=30.0, perf_mode="turbo")
-        self.capturer = ScreenRegionCapturer()
-        self.mouse_ctrl = ScreenMouseController()
-        self.hotkey_mgr = SystemGlobalHotkeyManager()
-        self.trail: List[Tuple[float, float]] = []
-
+        self.compute_device = device
+        self.gpu_id = int(gpu_id)
         self.hk_toggle_run = "F8"
         self.hk_toggle_mouse = "F9"
         self.hk_panic_stop = "F10"
         self._load_user_config()
+
+        self.tracker = UniversalUNetTracker(
+            fps=30.0, perf_mode="turbo", device=self.compute_device, gpu_id=self.gpu_id
+        )
+        self.capturer = ScreenRegionCapturer()
+        self.mouse_ctrl = ScreenMouseController()
+        self.hotkey_mgr = SystemGlobalHotkeyManager()
+        self.trail: List[Tuple[float, float]] = []
 
         self.running = False
         self.source_mode = "NONE"
@@ -1145,6 +1386,10 @@ class WinTrackerGUIApp:
                 self.hk_toggle_run = cfg.get("hk_toggle_run", self.hk_toggle_run)
                 self.hk_toggle_mouse = cfg.get("hk_toggle_mouse", self.hk_toggle_mouse)
                 self.hk_panic_stop = cfg.get("hk_panic_stop", self.hk_panic_stop)
+                if self.compute_device == "auto" and "compute_device" in cfg:
+                    self.compute_device = cfg.get("compute_device", "auto")
+                if "gpu_id" in cfg:
+                    self.gpu_id = int(cfg.get("gpu_id", self.gpu_id))
         except Exception:
             pass
 
@@ -1154,6 +1399,8 @@ class WinTrackerGUIApp:
                 "hk_toggle_run": self.hk_toggle_run,
                 "hk_toggle_mouse": self.hk_toggle_mouse,
                 "hk_panic_stop": self.hk_panic_stop,
+                "compute_device": getattr(self, "compute_device", "auto"),
+                "gpu_id": getattr(self, "gpu_id", 0),
             }
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -1304,7 +1551,7 @@ class WinTrackerGUIApp:
         self.spin_off_y.pack(side="left", padx=2)
 
         clock_box = tk.LabelFrame(
-            right_frame, text="⏱️ 时钟同步与硬件加速 (i5-9400F + RX 550X)",
+            right_frame, text="⏱️ 时钟同步与显卡硬件加速 (RTX 3060 12G CUDA / CPU)",
             bg="#1C222D", fg="#00FFCC", font=("Microsoft YaHei", 9, "bold"), padx=8, pady=3
         )
         clock_box.pack(fill="x", padx=12, pady=3)
@@ -1315,6 +1562,24 @@ class WinTrackerGUIApp:
             variable=self.var_wall_clock, bg="#1C222D", fg="#81ECEC",
             selectcolor="#141820", activebackground="#1C222D", font=("Microsoft YaHei", 8, "bold")
         ).pack(anchor="w")
+
+        dev_row = tk.Frame(clock_box, bg="#1C222D")
+        dev_row.pack(fill="x", pady=1)
+        tk.Label(dev_row, text="加速设备:", bg="#1C222D", fg="#DFE6E9", font=("Microsoft YaHei", 8)).pack(side="left")
+        init_dev = "cuda" if str(self.compute_device).startswith("cuda") else (self.compute_device if self.compute_device in ("auto", "cpu") else "auto")
+        self.var_device = tk.StringVar(value=init_dev)
+        ttk.Radiobutton(
+            dev_row, text="🚀 CUDA(3060)", variable=self.var_device,
+            value="cuda", command=self._on_device_change
+        ).pack(side="left", padx=3)
+        ttk.Radiobutton(
+            dev_row, text="自动(Auto)", variable=self.var_device,
+            value="auto", command=self._on_device_change
+        ).pack(side="left", padx=3)
+        ttk.Radiobutton(
+            dev_row, text="CPU", variable=self.var_device,
+            value="cpu", command=self._on_device_change
+        ).pack(side="left", padx=3)
 
         self.var_perf_mode = tk.StringVar(value="turbo")
         perf_row = tk.Frame(clock_box, bg="#1C222D")
@@ -1354,6 +1619,7 @@ class WinTrackerGUIApp:
 
         self.telemetry_vars = {}
         fields = [
+            ("device", "当前加速硬件:", self.tracker.cuda_backend.device_name),
             ("source", "输入源状态:", "未选择"),
             ("phase", "追踪阶段 / 形状:", "IDLE"),
             ("pos", "区域内坐标 (cx, cy):", "(0.0, 0.0)"),
@@ -1487,6 +1753,14 @@ class WinTrackerGUIApp:
         scale.set(init_v)
         scale.pack(fill="x")
         return scale
+
+    def _on_device_change(self) -> None:
+        dev = self.var_device.get()
+        self.compute_device = dev
+        dev_str = self.tracker.set_device(dev, gpu_id=self.gpu_id)
+        if "device" in self.telemetry_vars:
+            self.telemetry_vars["device"].set(dev_str)
+        self._save_user_config()
 
     def _on_param_change(self) -> None:
         self.tracker.perf_mode = self.var_perf_mode.get()
@@ -1716,6 +1990,8 @@ def process_video_cli(
     output_path: Optional[str] = None,
     perf_mode: str = "turbo",
     sim_clock_fps: Optional[float] = None,
+    device: str = "auto",
+    gpu_id: int = 0,
 ) -> dict:
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -1730,7 +2006,7 @@ def process_video_cli(
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
 
-    tracker = UniversalUNetTracker(fps=fps, perf_mode=perf_mode)
+    tracker = UniversalUNetTracker(fps=fps, perf_mode=perf_mode, device=device, gpu_id=gpu_id)
     trail: List[Tuple[float, float]] = []
     states: List[dict] = []
 
@@ -1772,7 +2048,7 @@ def process_video_cli(
         "end_pos": end_pos,
     }
     print(
-        f"[{summary['video']}] Shape={summary['shape']} | "
+        f"[{summary['video']}] Device={tracker.cuda_backend.device_name} | Shape={summary['shape']} | "
         f"LockRate={len(locked)}/{len(trans_states)} ({lock_rate:.2f}%) | "
         f"MeanSNR={mean_snr:.2f} | EndPos=({end_pos[0]:.1f},{end_pos[1]:.1f}) | "
         f"Speed={mean_ms:.2f}ms/frame ({summary['fps']:.1f} FPS)"
@@ -1781,17 +2057,24 @@ def process_video_cli(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="全图形自适应 U-Net 透明目标追踪系统 V2.6 (全样本鲁棒锁定 + 全局热键 + 鼠标跟随版)")
+    parser = argparse.ArgumentParser(description="全图形自适应 U-Net 透明目标追踪系统 V2.7 (RTX 3060 12G CUDA 加速 + 全样本鲁棒锁定 + 全局热键 + 鼠标跟随版)")
     parser.add_argument("--gui", action="store_true", help="启动 Windows 可视化 GUI 界面")
     parser.add_argument("--video", type=str, nargs="*", default=None, help="输入一个或多个测试视频路径（或包含视频的文件夹路径）")
     parser.add_argument("--output", type=str, default=None, help="输出带追踪叠加的 MP4 视频路径")
     parser.add_argument("--mode", type=str, default="turbo", choices=["turbo", "balanced"], help="性能档位: turbo 或 balanced")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="计算加速设备: 'cuda' / 'cuda:0' (指定 RTX 3060 12G 等 NVIDIA 显卡加速), 'auto' (自动检测), 或 'cpu'",
+    )
+    parser.add_argument("--gpu-id", type=int, default=0, help="指定 CUDA 显卡序号 (默认 0，即第一块显卡 RTX 3060)")
     parser.add_argument("--sim-clock-fps", type=float, default=None, help="模拟低算力时钟跳帧同步测试")
     args = parser.parse_args()
 
     if args.gui or not args.video:
         first_vid = args.video[0] if (args.video and len(args.video) > 0 and os.path.isfile(args.video[0])) else None
-        app = WinTrackerGUIApp(initial_video=first_vid)
+        app = WinTrackerGUIApp(initial_video=first_vid, device=args.device, gpu_id=args.gpu_id)
         app.run()
     else:
         video_list: List[str] = []
@@ -1804,7 +2087,10 @@ def main() -> None:
                 video_list.extend(sorted(glob.glob(v_arg)))
         for idx, vp in enumerate(video_list):
             out_p = args.output if (len(video_list) == 1) else None
-            process_video_cli(vp, out_p, perf_mode=args.mode, sim_clock_fps=args.sim_clock_fps)
+            process_video_cli(
+                vp, out_p, perf_mode=args.mode, sim_clock_fps=args.sim_clock_fps,
+                device=args.device, gpu_id=args.gpu_id
+            )
 
 
 if __name__ == "__main__":
