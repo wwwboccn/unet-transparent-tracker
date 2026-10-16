@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+
 jobs:
   build-windows-exe:
     name: Package Windows x64 Standalone EXE
@@ -38,10 +42,11 @@ jobs:
 
       - name: 5. Build Standalone Windows Executables via PyInstaller
         run: |
-          python scripts/build_windows_exe.py
+          python -X utf8 scripts/build_windows_exe.py
 
       - name: 6. Smoke-Test Built EXE on Windows Runner
         run: |
+          chcp 65001 > $null
           .\dist\UNetTracker_V3.0_Portable\UNetTracker_V3.0_Server_CLI.exe --help
 
       - name: 7. Upload Windows EXE Artifact (Available on Actions Tab)

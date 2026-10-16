@@ -40,11 +40,17 @@ import multiprocessing
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
-# PyInstaller --noconsole (windowed) 模式下 sys.stdout / sys.stderr 为 None，重定向至 devnull 防止 print 崩溃
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="ignore")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="ignore")
+# 兼容 PyInstaller --noconsole (stdout/stderr 为 None) 与 Windows cp1252/gbk 控制台编码，彻底杜绝 UnicodeEncodeError
+for _sname in ("stdout", "stderr"):
+    _s = getattr(sys, _sname, None)
+    if _s is None:
+        setattr(sys, _sname, open(os.devnull, "w", encoding="utf-8", errors="ignore"))
+    elif hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 
 
 def get_application_dir() -> str:
