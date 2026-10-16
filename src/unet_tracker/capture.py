@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-零开销 Windows 屏幕区域捕获器：优先复用持久化 MSS 实例，自动回退至 PIL.ImageGrab 或原生 Win32 GDI BitBlt。
+零开销 Windows 屏幕区域捕获器 (MSS / PIL / Win32 GDI 三级自动回退)。
 """
 
 import ctypes
@@ -10,7 +10,9 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
-
+# ==============================================================================
+# 5. 零开销 Windows 屏幕区域捕获器 (持久化复用 MSS / Win32 GDI 句柄)
+# ==============================================================================
 class ScreenRegionCapturer:
     def __init__(self):
         self._mss_inst = None
@@ -85,3 +87,5 @@ class ScreenRegionCapturer:
             return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
         except Exception:
             return None
+
+

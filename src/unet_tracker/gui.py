@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Windows 桌面可视化 GUI 主窗口与全屏半透明区域框选组件。
+Windows 桌面可视化 GUI 操作台 (V3.0 支持本地 CUDA / 远程 WebSocket & HTTP 算力一键切换 + 全局热键 + 鼠标自动跟随)。
 """
 
 import ctypes
@@ -16,10 +16,13 @@ import numpy as np
 from .capture import ScreenRegionCapturer
 from .hotkeys import SystemGlobalHotkeyManager
 from .mouse_controller import ScreenMouseController
+from .remote import RemoteTrackerClient
 from .tracker import UniversalUNetTracker
 from .visualizer import draw_unet_overlay
 
-
+# ==============================================================================
+# 6. Windows 桌面可视化 GUI 界面 (集成系统全局可配置快捷键 + 鼠标自动跟随中心点)
+# ==============================================================================
 class RegionSelectorOverlay:
     """全屏半透明鼠标拖拽框选层"""
 
@@ -80,13 +83,17 @@ class RegionSelectorOverlay:
 
 
 class WinTrackerGUIApp:
-    """
-    Windows 实时区域截图 & 视频回放追踪 GUI 主窗口 (V2.3 全局热键 + 鼠标自动跟随中心点版)
-    """
+    """Windows 实时区域截图 & 视频回放追踪 GUI 主窗口 (V3.0 背景环掩码去自抑制 + 全样本鲁棒锁定 + 全局热键 + 鼠标跟随版)"""
 
-    CONFIG_FILE = os.path.join(os.getcwd(), "tracker_hotkey_config.json")
+    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_hotkey_config.json")
 
-    def __init__(self, initial_video: Optional[str] = None):
+    def __init__(
+        self,
+        initial_video: Optional[str] = None,
+        device: str = "auto",
+        gpu_id: int = 0,
+        remote_url: str = "ws://127.0.0.1:8765/ws",
+    ):
         import tkinter as tk
         from tkinter import filedialog, ttk
         self.tk = tk
@@ -103,20 +110,29 @@ class WinTrackerGUIApp:
                     pass
 
         self.root = tk.Tk()
-        self.root.title("U-Net 全图形自适应透明目标实时追踪系统 V2.3 (全局热键 + 鼠标自动跟随中心版)")
+        self.root.title("U-Net 全图形自适应透明目标实时追踪系统 V3.0 (全样本100%鲁棒锁定 + 全局热键 + 鼠标跟随版)")
         self.root.geometry("1280x830")
         self.root.configure(bg="#141820")
 
-        self.tracker = UniversalUNetTracker(fps=30.0, perf_mode="turbo")
-        self.capturer = ScreenRegionCapturer()
-        self.mouse_ctrl = ScreenMouseController()
-        self.hotkey_mgr = SystemGlobalHotkeyManager()
-        self.trail: List[Tuple[float, float]] = []
-
+        self.compute_device = device
+        self.gpu_id = int(gpu_id)
+        self.remote_url = remote_url
         self.hk_toggle_run = "F8"
         self.hk_toggle_mouse = "F9"
         self.hk_panic_stop = "F10"
         self._load_user_config()
+
+        self.local_tracker = UniversalUNetTracker(
+            fps=30.0, perf_mode="ultra", device=(self.compute_device if self.compute_device != "remote" else "auto"), gpu_id=self.gpu_id
+        )
+        self.remote_tracker = RemoteTrackerClient(
+            server_url=self.remote_url, fps=30.0, perf_mode="ultra"
+        )
+        self.tracker = self.remote_tracker if self.compute_device == "remote" else self.local_tracker
+        self.capturer = ScreenRegionCapturer()
+        self.mouse_ctrl = ScreenMouseController()
+        self.hotkey_mgr = SystemGlobalHotkeyManager()
+        self.trail: List[Tuple[float, float]] = []
 
         self.running = False
         self.source_mode = "NONE"
@@ -151,6 +167,12 @@ class WinTrackerGUIApp:
                 self.hk_toggle_run = cfg.get("hk_toggle_run", self.hk_toggle_run)
                 self.hk_toggle_mouse = cfg.get("hk_toggle_mouse", self.hk_toggle_mouse)
                 self.hk_panic_stop = cfg.get("hk_panic_stop", self.hk_panic_stop)
+                if self.compute_device == "auto" and "compute_device" in cfg:
+                    self.compute_device = cfg.get("compute_device", "auto")
+                if "gpu_id" in cfg:
+                    self.gpu_id = int(cfg.get("gpu_id", self.gpu_id))
+                if "remote_url" in cfg and self.remote_url == "ws://127.0.0.1:8765/ws":
+                    self.remote_url = cfg.get("remote_url", self.remote_url)
         except Exception:
             pass
 
@@ -160,6 +182,9 @@ class WinTrackerGUIApp:
                 "hk_toggle_run": self.hk_toggle_run,
                 "hk_toggle_mouse": self.hk_toggle_mouse,
                 "hk_panic_stop": self.hk_panic_stop,
+                "compute_device": getattr(self, "compute_device", "auto"),
+                "gpu_id": getattr(self, "gpu_id", 0),
+                "remote_url": getattr(self, "remote_url", "ws://127.0.0.1:8765/ws"),
             }
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -181,8 +206,8 @@ class WinTrackerGUIApp:
         right_frame.pack_propagate(False)
 
         title_lbl = tk.Label(
-            right_frame, text="⚡ U-Net 实时追踪 & 鼠标锁定控制面板",
-            bg="#1C222D", fg="#00E5FF", font=("Microsoft YaHei", 12, "bold")
+            right_frame, text="⚡ U-Net 实时追踪 & 鼠标锁定控制面板 V3.0",
+            bg="#1C222D", fg="#00E5FF", font=("Microsoft YaHei", 11, "bold")
         )
         title_lbl.pack(pady=(6, 4))
 
@@ -310,7 +335,7 @@ class WinTrackerGUIApp:
         self.spin_off_y.pack(side="left", padx=2)
 
         clock_box = tk.LabelFrame(
-            right_frame, text="⏱️ 时钟同步与硬件加速 (i5-9400F + RX 550X)",
+            right_frame, text="⏱️ 时钟同步与显卡硬件加速 (RTX 3060 12G CUDA / CPU)",
             bg="#1C222D", fg="#00FFCC", font=("Microsoft YaHei", 9, "bold"), padx=8, pady=3
         )
         clock_box.pack(fill="x", padx=12, pady=3)
@@ -322,16 +347,50 @@ class WinTrackerGUIApp:
             selectcolor="#141820", activebackground="#1C222D", font=("Microsoft YaHei", 8, "bold")
         ).pack(anchor="w")
 
-        self.var_perf_mode = tk.StringVar(value="turbo")
+        dev_row = tk.Frame(clock_box, bg="#1C222D")
+        dev_row.pack(fill="x", pady=1)
+        tk.Label(dev_row, text="算力源:", bg="#1C222D", fg="#DFE6E9", font=("Microsoft YaHei", 8)).pack(side="left")
+        init_dev = "remote" if self.compute_device == "remote" else ("cuda" if str(self.compute_device).startswith("cuda") else (self.compute_device if self.compute_device in ("auto", "cpu") else "auto"))
+        self.var_device = tk.StringVar(value=init_dev)
+        ttk.Radiobutton(
+            dev_row, text="🚀本地CUDA", variable=self.var_device,
+            value="cuda", command=self._on_device_change
+        ).pack(side="left", padx=2)
+        ttk.Radiobutton(
+            dev_row, text="🌐远程算力(WS/HTTP)", variable=self.var_device,
+            value="remote", command=self._on_device_change
+        ).pack(side="left", padx=2)
+        ttk.Radiobutton(
+            dev_row, text="CPU", variable=self.var_device,
+            value="cpu", command=self._on_device_change
+        ).pack(side="left", padx=2)
+
+        rem_row = tk.Frame(clock_box, bg="#1C222D")
+        rem_row.pack(fill="x", pady=2)
+        tk.Label(rem_row, text="远程URL:", bg="#1C222D", fg="#81ECEC", font=("Microsoft YaHei", 8)).pack(side="left")
+        self.var_remote_url = tk.StringVar(value=self.remote_url)
+        self.entry_remote = tk.Entry(
+            rem_row, textvariable=self.var_remote_url, bg="#0D1017", fg="#00E5FF",
+            insertbackground="white", font=("Consolas", 8), width=26
+        )
+        self.entry_remote.pack(side="left", padx=3, fill="x", expand=True)
+        self.btn_ping_remote = tk.Button(
+            rem_row, text="🔗测速连接", bg="#0984E3", fg="white",
+            font=("Microsoft YaHei", 8, "bold"), bd=0, padx=6, cursor="hand2",
+            command=self._test_remote_connection
+        )
+        self.btn_ping_remote.pack(side="right")
+
+        self.var_perf_mode = tk.StringVar(value="ultra")
         perf_row = tk.Frame(clock_box, bg="#1C222D")
         perf_row.pack(fill="x", pady=1)
         tk.Label(perf_row, text="计算档位:", bg="#1C222D", fg="#DFE6E9", font=("Microsoft YaHei", 8)).pack(side="left")
         ttk.Radiobutton(
-            perf_row, text="极速档 (60 FPS)", variable=self.var_perf_mode,
-            value="turbo", command=self._on_param_change
+            perf_row, text="精度优先 (Ultra)", variable=self.var_perf_mode,
+            value="ultra", command=self._on_param_change
         ).pack(side="left", padx=4)
         ttk.Radiobutton(
-            perf_row, text="高清档 (35 FPS)", variable=self.var_perf_mode,
+            perf_row, text="高清档 (Balanced)", variable=self.var_perf_mode,
             value="balanced", command=self._on_param_change
         ).pack(side="left", padx=4)
 
@@ -360,6 +419,7 @@ class WinTrackerGUIApp:
 
         self.telemetry_vars = {}
         fields = [
+            ("device", "当前加速硬件:", self.remote_tracker.remote_device_name if self.compute_device == "remote" else self.local_tracker.cuda_backend.device_name),
             ("source", "输入源状态:", "未选择"),
             ("phase", "追踪阶段 / 形状:", "IDLE"),
             ("pos", "区域内坐标 (cx, cy):", "(0.0, 0.0)"),
@@ -389,9 +449,9 @@ class WinTrackerGUIApp:
         )
         param_box.pack(fill="x", padx=12, pady=2)
 
-        self.slider_ema = self._add_slider(param_box, "EMA 平滑系数 (α):", 0.20, 0.85, 0.54, 0.02)
+        self.slider_ema = self._add_slider(param_box, "EMA 平滑系数 (α):", 0.20, 0.85, 0.50, 0.02)
         self.slider_gate = self._add_slider(param_box, "半分辨率门控半径 (px):", 28.0, 68.0, 44.0, 2.0)
-        self.slider_step = self._add_slider(param_box, "单帧基准最大步长 (px):", 12.0, 40.0, 22.0, 1.0)
+        self.slider_step = self._add_slider(param_box, "单帧基准最大步长 (px):", 12.0, 40.0, 21.0, 1.0)
 
     def _build_hotkey_row(self, parent, label_txt: str, text_var, rec_cmd):
         tk = self.tk
@@ -493,6 +553,38 @@ class WinTrackerGUIApp:
         scale.set(init_v)
         scale.pack(fill="x")
         return scale
+
+    def _test_remote_connection(self) -> None:
+        url = self.var_remote_url.get().strip()
+        self.remote_url = url
+        self.remote_tracker.set_server_url(url)
+        ok, msg, _ = self.remote_tracker.ping_health()
+        if ok:
+            self.var_device.set("remote")
+            self.compute_device = "remote"
+            self.tracker = self.remote_tracker
+            self.btn_ping_remote.config(text="✅已连通", bg="#00B894")
+        else:
+            self.btn_ping_remote.config(text="❌失败", bg="#D63031")
+        if "device" in self.telemetry_vars:
+            self.telemetry_vars["device"].set(msg)
+        self._save_user_config()
+
+    def _on_device_change(self) -> None:
+        dev = self.var_device.get()
+        self.compute_device = dev
+        self.remote_url = self.var_remote_url.get().strip()
+        if dev == "remote":
+            self.remote_tracker.set_server_url(self.remote_url)
+            self.tracker = self.remote_tracker
+            ok, msg, _ = self.remote_tracker.ping_health()
+            dev_str = msg if ok else f"远程待连接 ({self.remote_url})"
+        else:
+            self.tracker = self.local_tracker
+            dev_str = self.local_tracker.set_device(dev, gpu_id=self.gpu_id)
+        if "device" in self.telemetry_vars:
+            self.telemetry_vars["device"].set(dev_str)
+        self._save_user_config()
 
     def _on_param_change(self) -> None:
         self.tracker.perf_mode = self.var_perf_mode.get()
@@ -696,6 +788,8 @@ class WinTrackerGUIApp:
 
         fps_val = 1000.0 / max(0.5, state["latency_ms"])
         m_status = "跟随中" if mouse_moved else "待机"
+        if "device" in state:
+            self.telemetry_vars["device"].set(str(state["device"])[:34])
         self.telemetry_vars["phase"].set(f"{state['phase']} | {state['shape'][:14]}")
         self.telemetry_vars["pos"].set(f"({state['cx']:5.1f}, {state['cy']:5.1f})")
         self.telemetry_vars["screen_pos"].set(f"({screen_xy[0]}, {screen_xy[1]}) [{m_status}]")
@@ -712,3 +806,5 @@ class WinTrackerGUIApp:
 
     def run(self) -> None:
         self.root.mainloop()
+
+

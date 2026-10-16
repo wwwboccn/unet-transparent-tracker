@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-可视化渲染模块：任意图形多边形轮廓 + U-Net 概率热力图 + 洋红鼠标锁定准星与实时 HUD
+U-Net 多边形轮廓、热力图与 HUD 状态叠加渲染模块。
 """
 
 from typing import List, Tuple
 import cv2
 import numpy as np
-from .tracker import UniversalUNetTracker
 
-
+# ==============================================================================
+# 4. 可视化渲染：任意图形多边形轮廓 + U-Net 热力图 + 鼠标锁定准星 HUD
+# ==============================================================================
 def draw_unet_overlay(
     frame_bgr: np.ndarray,
     state: dict,
     trail: List[Tuple[float, float]],
-    tracker: UniversalUNetTracker,
+    tracker,
     show_heatmap: bool = False,
     show_hud: bool = True,
     clock_drift_sec: float = 0.0,
@@ -29,7 +30,7 @@ def draw_unet_overlay(
         prob_full = cv2.resize(tracker.last_unet_prob_s, (W, H), interpolation=cv2.INTER_LINEAR)
         prob_u8 = np.clip(prob_full * 255.0, 0, 255).astype(np.uint8)
         heat = cv2.applyColorMap(prob_u8, cv2.COLORMAP_TURBO)
-        active = prob_full > 0.24
+        active = prob_full > 0.22
         if np.any(active):
             canvas[active] = cv2.addWeighted(canvas[active], 0.58, heat[active], 0.42, 0.0)
 
@@ -91,3 +92,5 @@ def draw_unet_overlay(
             (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (0, 225, 255), 1, cv2.LINE_AA
         )
     return canvas
+
+

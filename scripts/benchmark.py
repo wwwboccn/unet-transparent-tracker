@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多视频自动化基准评测脚本：测试 30FPS 满帧速度/锁定率与 10FPS 真实时钟跳帧鲁棒性。
+V3.0 多视频自动化基准评测脚本：测试 Ultra 精度优先模式 (支持 --device cuda / auto / cpu)。
 用法: python scripts/benchmark.py video1.mp4 video2.mp4 ...
 """
 
@@ -14,13 +14,13 @@ from unet_tracker.cli import process_video_cli
 
 
 def run_benchmarks(video_paths):
-    print("=== 1. 30 FPS 满帧逐帧推理基准测试 (Turbo 模式) ===")
+    print("=== 1. V3.0 Ultra 几何中心锁定全帧推理基准测试 ===")
     for vp in video_paths:
-        process_video_cli(vp, perf_mode="turbo")
+        process_video_cli(vp, perf_mode="ultra", device="auto")
 
     print("\n=== 2. 10 FPS 真实时钟同步跳帧鲁棒性测试 (dt=0.10s, n_step=3.0x) ===")
     for vp in video_paths:
-        process_video_cli(vp, perf_mode="turbo", sim_clock_fps=10.0)
+        process_video_cli(vp, perf_mode="ultra", sim_clock_fps=10.0, device="auto")
 
 
 if __name__ == "__main__":

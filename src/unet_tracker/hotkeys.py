@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-系统级全局可配置快捷键管理器：
-基于 Windows 原生 user32.GetAsyncKeyState 独立后台线程 (12ms 轮询 + 上升沿消抖)，
-支持单键 (F1~F12, ~, SPACE)、修饰组合键 (Ctrl+F8, Alt+S) 与鼠标侧键 (MOUSE_X1/X2) 以及一键按键录制。
+Windows 全局快捷键监听与按键录制模块。
 """
 
 import ctypes
@@ -12,6 +10,9 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
+# ==============================================================================
+# 1. Windows 虚拟键码映射表与全局热键监听器 (无需第三方库，支持任意单键/组合键/录制)
+# ==============================================================================
 VK_NAME_TO_CODE: Dict[str, int] = {
     **{f"F{i}": 0x70 + (i - 1) for i in range(1, 13)},
     **{str(i): 0x30 + i for i in range(10)},
@@ -36,6 +37,7 @@ VK_CODE_TO_NAME[0xC0] = "`"
 
 
 def parse_hotkey_string(hotkey_str: str) -> Tuple[List[int], Optional[int], str]:
+    """解析快捷键字符串（如 'F8', 'Ctrl+F8', 'Alt+S', 'MOUSE_X1'）为 (修饰键VK列表, 主键VK, 规范化名称)"""
     parts = [p.strip().upper() for p in hotkey_str.replace(" ", "").split("+") if p.strip()]
     if not parts:
         return [], 0x77, "F8"
@@ -70,6 +72,8 @@ def parse_hotkey_string(hotkey_str: str) -> Tuple[List[int], Optional[int], str]
 
 
 class SystemGlobalHotkeyManager:
+    """跨窗口系统级全局快捷键管理器（基于 Win32 GetAsyncKeyState 12ms 后台监听 + 上升沿消抖）"""
+
     def __init__(self):
         self.is_windows = platform.system() == "Windows"
         self.user32 = ctypes.windll.user32 if self.is_windows else None
@@ -159,3 +163,5 @@ class SystemGlobalHotkeyManager:
                             info["was_pressed"] = False
 
             time.sleep(0.012)
+
+

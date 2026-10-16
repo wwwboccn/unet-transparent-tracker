@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Windows 鼠标实时控制器：将系统鼠标移动到屏幕对应的追踪中心点坐标 (screen_x, screen_y)。
-支持 Win32 SetCursorPos 与 SendInput (MOUSEEVENTF_ABSOLUTE) 双驱动模式、速度前馈补偿与像素微调。
+Windows 屏幕鼠标坐标实时控制器 (支持 SetCursorPos 与底层 SendInput)。
 """
 
 import ctypes
 import platform
 from typing import Tuple
 
-
+# ==============================================================================
+# 2. Windows 鼠标实时控制器 (将鼠标精准移动到屏幕对应追踪中心点)
+# ==============================================================================
 class ScreenMouseController:
+    """控制系统鼠标实时移动到屏幕对应的追踪中心点坐标 (screen_x, screen_y)"""
+
     def __init__(self):
         self.is_windows = platform.system() == "Windows"
         self.user32 = ctypes.windll.user32 if self.is_windows else None
         self.enabled = False
         self.driver_mode = "setcursorpos"  # "setcursorpos" | "sendinput"
-        self.only_transparent = False      # True=仅透明阶段移动鼠标, False=白色+透明全程跟随
-        self.lead_ms = 15.0                # 速度前馈补偿毫秒数
-        self.offset_x = 0                  # 屏幕 X 偏移微调 (px)
-        self.offset_y = 0                  # 屏幕 Y 偏移微调 (px)
+        self.only_transparent = False
+        self.lead_ms = 15.0
+        self.offset_x = 0
+        self.offset_y = 0
         self.last_screen_pos: Tuple[int, int] = (0, 0)
 
     def move_to_screen_point(self, screen_x: float, screen_y: float) -> Tuple[int, int]:
@@ -51,3 +54,5 @@ class ScreenMouseController:
             self.user32.mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, norm_x, norm_y, 0, 0)
         except Exception:
             self.user32.SetCursorPos(x, y)
+
+
