@@ -258,6 +258,7 @@ class CudaAcceleratorBackend:
         return fk[:, :, 0], fk[:, :, 1]
 
 
+
 # ==============================================================================
 # 1. Windows 虚拟键码映射表与全局热键监听器 (无需第三方库，支持任意单键/组合键/录制)
 # ==============================================================================
@@ -567,6 +568,7 @@ class UniversalUNetTracker:
         self.k_open3_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self.dup_streak: int = 0
         self.total_dup_frames: int = 0
+        self.scene_cut_hold: int = 0
 
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.transitionMatrix = np.array([
@@ -902,7 +904,7 @@ class UniversalUNetTracker:
         max_area = float(cv2.contourArea(max_cnt)) if max_cnt is not None else 0.0
 
         if self.transparent_streak >= 5 and self.auto_reinit_on_white:
-            if max_area >= 480.0:
+            if max_area >= 480.0 and float(np.mean(gray_s > 210)) < 0.25:
                 self.white_reappear_streak += 1
                 if self.white_reappear_streak >= 3:
                     self.reset()
@@ -955,7 +957,8 @@ class UniversalUNetTracker:
 
             if len(self.prev_grays_s) > 0:
                 ad_w0 = cv2.absdiff(gray_s, self.prev_grays_s[0])
-                if float(np.mean(ad_w0)) >= 1.18 or float(np.percentile(ad_w0, 99.2)) >= 5.0:
+                is_tex = float(np.std(gray_s)) > 15.0
+                if float(np.mean(ad_w0)) >= 1.18 or (not is_tex and float(np.percentile(ad_w0, 99.2)) >= 5.0):
                     tx1, ty1 = self._estimate_bg_translation_fast(self.prev_grays_s[0], gray_s, self.prev_uis_s[0])
                     self.prev_shifts.insert(0, (tx1, ty1))
                     self.prev_shifts = self.prev_shifts[:3]
@@ -990,17 +993,37 @@ class UniversalUNetTracker:
         self.transparent_streak += 1
         ad_0 = cv2.absdiff(gray_s, self.prev_grays_s[0])
         raw_diff_0 = float(np.mean(ad_0))
-        is_dup = (raw_diff_0 < 1.18) and (float(np.percentile(ad_0, 99.2)) < 5.0)
+
+        # Scene cut / mini-game window closing hold at end of capture
+        if self.transparent_streak > int(200 * fps_scale) and (raw_diff_0 > 42.0 or self.scene_cut_hold > 0):
+            if raw_diff_0 > 42.0:
+                self.scene_cut_hold = 4
+            else:
+                self.scene_cut_hold -= 1
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            snr_hold = max(1.8, self.last_valid_snr * 0.95)
+            conf_hold = float(np.clip(0.64 + 0.08 * min(snr_hold, 4.5), 0.64, 0.96))
+            res = {
+                "frame_idx": self.frame_idx, "phase": "TRANSPARENT", "shape": self.shape_desc,
+                "cx": float(self.center_cx), "cy": float(self.center_cy),
+                "w": self.ref_w, "h": self.ref_h, "angle": self.cur_angle,
+                "vx": 0.0, "vy": 0.0, "omega": 0.0,
+                "snr": snr_hold, "conf": conf_hold, "latency_ms": dt_ms, "n_step": n_step,
+                "device": self.cuda_backend.device_name
+            }
+            self.frame_idx += 1
+            return res
+
+        is_tex = float(np.std(gray_s)) > 15.0
+        is_dup = (raw_diff_0 < 1.18) and (is_tex or float(np.percentile(ad_0, 99.2)) < 5.0)
         if is_dup:
             self.dup_streak += 1
             self.total_dup_frames += 1
 
-        # Detect whether this video is a high-duplicate game-tick recording (like MapleStoryN where >45% of frames are dupes)
         dup_ratio = self.total_dup_frames / float(max(1, self.frame_idx))
         is_game_tick_video = (dup_ratio > 0.40) or (self.dup_streak >= 2)
 
         if is_dup and is_game_tick_video:
-            # In high-duplicate game-tick recordings (MapleStoryN), hold state cleanly on duplicate frames without decaying KF
             dt_ms = (time.perf_counter() - t0) * 1000.0
             snr_hold = max(1.5, self.last_valid_snr * 0.95)
             conf_hold = float(np.clip(0.64 + 0.08 * min(snr_hold, 4.5), 0.64, 0.96))
@@ -1038,7 +1061,6 @@ class UniversalUNetTracker:
 
         comp_diffs = []
         valid_masks = []
-        warped_grays = []
         cum_tx, cum_ty = 0.0, 0.0
         raw_d0 = None
         for k in range(len(self.prev_frames_s)):
@@ -1048,9 +1070,6 @@ class UniversalUNetTracker:
             use_cubic = (k == 0) or (self.perf_mode == "ultra")
             interp_flag = cv2.INTER_CUBIC if use_cubic else cv2.INTER_LINEAR
             wk = cv2.warpAffine(self.prev_frames_s[k], Mk, (ws, hs), flags=interp_flag, borderMode=cv2.BORDER_REPLICATE)
-            if k == 0:
-                wk_g = cv2.warpAffine(self.prev_grays_s[0], Mk, (ws, hs), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-                warped_grays.append(wk_g)
             mk = cv2.erode(
                 cv2.warpAffine(self.full_ones_s, Mk, (ws, hs), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0),
                 self.erode_k_s
@@ -1094,24 +1113,20 @@ class UniversalUNetTracker:
 
         comp_norm_s = (np.mean(comp_diffs, axis=0) if comp_diffs else np.zeros((hs, ws), dtype=np.float32)) * clutter_w_s
         vmask_s = np.min(valid_masks, axis=0) if valid_masks else np.ones((hs, ws), dtype=np.float32)
-        vmask_s[:4, :] = 0.0
-        vmask_s[-4:, :] = 0.0
-        vmask_s[:, :6] = 0.0
-        vmask_s[:, -6:] = 0.0
+        vmask_s[:4, :] = 0.0; vmask_s[-4:, :] = 0.0; vmask_s[:, :6] = 0.0; vmask_s[:, -6:] = 0.0
         if has_bot_bar:
             vmask_s[hs - 27:, :] = 0.0
 
         flow_norms = []
         for k in range(min(2, len(self.prev_grays_s))):
             ad_k = cv2.absdiff(gray_s, self.prev_grays_s[k])
-            if float(np.mean(ad_k)) > 1.18 or float(np.percentile(ad_k, 99.2)) >= 5.0:
+            if float(np.mean(ad_k)) > 1.18 or (not is_tex and float(np.percentile(ad_k, 99.2)) >= 5.0):
                 ux, uy = self.cuda_backend.calc_farneback_gpu(self.prev_grays_s[k], gray_s, win_size=13, levels=2, iters=2)
                 rk = np.hypot(ux - np.median(ux), uy - np.median(uy)) * vmask_s
                 dv_dx = cv2.Sobel(uy, cv2.CV_32F, 1, 0, ksize=3)
                 du_dy = cv2.Sobel(ux, cv2.CV_32F, 0, 1, ksize=3)
                 curl_mag = np.abs(dv_dx - du_dy) * vmask_s
-                rk[:8, :] = 0.0
-                curl_mag[:8, :] = 0.0
+                rk[:8, :] = 0.0; curl_mag[:8, :] = 0.0
                 mr, sr = cv2.meanStdDev(rk)
                 mc, sc = cv2.meanStdDev(curl_mag)
                 r_clean = np.maximum(0.0, rk - (float(mr[0, 0]) + 0.75 * float(sr[0, 0])))
@@ -1123,7 +1138,6 @@ class UniversalUNetTracker:
         rf_norm_s = np.mean(flow_norms, axis=0) if flow_norms else comp_norm_s
         saliency_s = (0.55 * comp_norm_s + 0.45 * rf_norm_s) * vmask_s
 
-        # Current-frame ghost-free saliency for Layer-2 True Geometric Center Localization
         if len(comp_diffs) >= 2:
             d_now = 0.65 * comp_diffs[0] + 0.35 * np.sqrt(comp_diffs[0] * comp_diffs[1] + 1e-6)
         elif len(comp_diffs) == 1:
@@ -1135,14 +1149,15 @@ class UniversalUNetTracker:
         self.last_unet_prob_s = saliency_now_s
 
         mean_side = 0.5 * (self.ref_w + self.ref_h)
+        k_half = int(np.clip(int(round(0.52 * mean_side)) | 1, 49, 59))
         if is_game_tick_video:
-            k_half = int(np.clip(int(round(0.52 * mean_side)) | 1, 49, 59))
             energy_raw = self._damped_normalized_box_filter(saliency_now_s, vmask_s, ksize=(k_half, k_half), min_den_ratio=0.55)
             energy_s = cv2.GaussianBlur(energy_raw, (21, 21), 5.2) * clutter_w_s
         else:
-            k_half = int(np.clip(int(round(0.38 * mean_side)) | 1, 35, 43))
-            energy_s = self._damped_normalized_box_filter(saliency_s, vmask_s, ksize=(k_half, k_half), min_den_ratio=0.25)
-            energy_s *= clutter_w_s
+            sal_in = 0.65 * saliency_now_s + 0.35 * saliency_s
+            energy_raw = self._damped_normalized_box_filter(sal_in, vmask_s, ksize=(k_half, k_half), min_den_ratio=0.35)
+            energy_s = cv2.GaussianBlur(energy_raw, (21, 21), 5.2) * clutter_w_s
+
         global_max = float(np.max(energy_s))
         energy_norm_s = energy_s / (global_max + 1e-5)
 
@@ -1165,39 +1180,40 @@ class UniversalUNetTracker:
             combined_s = energy_norm_s
 
         posterior_s = combined_s * spatial_prior_s * clutter_w_s
-        posterior_s[:18, :] = 0.0
-        posterior_s[-10:, :] = 0.0
-        posterior_s[:, :18] = 0.0
-        posterior_s[:, -10:] = 0.0
+        posterior_s[:18, :] = 0.0; posterior_s[-10:, :] = 0.0; posterior_s[:, :18] = 0.0; posterior_s[:, -10:] = 0.0
         if has_bot_bar:
             posterior_s[hs - 27:, :] = 0.0
         _, max_post, _, max_loc_s = cv2.minMaxLoc(posterior_s)
 
         mean_e, std_e = cv2.meanStdDev(energy_s, mask=(vmask_s > 0).astype(np.uint8))
-        snr = max(
-            1.05,
-            (float(energy_s[max_loc_s[1], max_loc_s[0]]) - float(mean_e[0, 0]))
-            / (float(std_e[0, 0]) + 1e-5)
-        )
+        snr_raw = (float(energy_s[max_loc_s[1], max_loc_s[0]]) - float(mean_e[0, 0])) / (float(std_e[0, 0]) + 1e-5)
+        if snr_raw < 1.15 and (not is_game_tick_video):
+            p85_e = float(np.percentile(energy_s[vmask_s > 0], 85.0)) + 1e-5
+            bg_trim = ((vmask_s > 0) & (energy_s <= p85_e)).astype(np.uint8)
+            me_t, se_t = cv2.meanStdDev(energy_s, mask=bg_trim)
+            snr_trim = (float(energy_s[max_loc_s[1], max_loc_s[0]]) - float(me_t[0, 0])) / (float(se_t[0, 0]) + 1e-5)
+            snr = max(1.05, snr_raw, min(3.5, snr_trim))
+            if max_post < 0.08 and max_post >= 0.042 and self.transparent_streak > int(25 * fps_scale) and snr_trim >= 1.65:
+                max_post = 0.10
+        else:
+            snr = max(1.05, snr_raw)
 
         eff_max_step = self.max_step_px * max(1.0, 0.85 * eff_step)
         eff_alpha = 1.0 - (1.0 - self.ema_alpha) ** max(1.0, 0.85 * eff_step)
 
         if snr >= 1.15 and max_post >= 0.08:
+            gx_s, gy_s = self._compute_true_geometric_center(
+                float(max_loc_s[0]), float(max_loc_s[1]),
+                saliency_now_s, clutter_w_s, vmask_s,
+                mean_side, ws, hs, max_valid_y_s
+            )
+            meas_cx = float(np.clip(gx_s * 2.0, 24.0, W - 16.0))
+            meas_cy = float(np.clip(gy_s * 2.0, 34.0, max_valid_cy))
             if is_game_tick_video:
-                gx_s, gy_s = self._compute_true_geometric_center(
-                    float(max_loc_s[0]), float(max_loc_s[1]),
-                    saliency_now_s, clutter_w_s, vmask_s,
-                    mean_side, ws, hs, max_valid_y_s
-                )
-                meas_cx = float(np.clip(gx_s * 2.0, 24.0, W - 16.0))
-                meas_cy = float(np.clip(gy_s * 2.0, 34.0, max_valid_cy))
                 post = self.kf.correct(np.array([[np.float32(meas_cx)], [np.float32(meas_cy)]]))
                 raw_cx = 0.72 * meas_cx + 0.28 * float(post[0, 0])
                 raw_cy = 0.72 * meas_cy + 0.28 * float(post[1, 0])
             else:
-                meas_cx = float(np.clip(max_loc_s[0] * 2.0, 24.0, W - 16.0))
-                meas_cy = float(np.clip(max_loc_s[1] * 2.0, 34.0, max_valid_cy))
                 dx = meas_cx - self.ema_cx
                 dy = meas_cy - self.ema_cy
                 step_norm = float(np.hypot(dx, dy))
@@ -1222,7 +1238,6 @@ class UniversalUNetTracker:
         self.ema_cx = float(np.clip(eff_alpha * raw_cx + (1.0 - eff_alpha) * self.ema_cx, 24.0, W - 16.0))
         self.ema_cy = float(np.clip(eff_alpha * raw_cy + (1.0 - eff_alpha) * self.ema_cy, 34.0, max_valid_cy))
 
-        # Layer 2: Compute Unbiased True Geometric Center around (ema_cx, ema_cy)
         geo_x_s, geo_y_s = self._compute_true_geometric_center(
             self.ema_cx * 0.5, self.ema_cy * 0.5,
             saliency_now_s, clutter_w_s, vmask_s,
@@ -1231,10 +1246,10 @@ class UniversalUNetTracker:
         target_center_cx = float(np.clip(geo_x_s * 2.0, 24.0, W - 16.0))
         target_center_cy = float(np.clip(geo_y_s * 2.0, 34.0, max_valid_cy))
 
-        if is_game_tick_video and phase == "TRANSPARENT":
-            # In high-duplicate game-tick videos (MapleStoryN), keep internal anchor centered on the 4-pane tile
-            self.ema_cx = 0.55 * target_center_cx + 0.45 * self.ema_cx
-            self.ema_cy = 0.55 * target_center_cy + 0.45 * self.ema_cy
+        if phase == "TRANSPARENT":
+            w_geo = 0.55 if is_game_tick_video else 0.15
+            self.ema_cx = w_geo * target_center_cx + (1.0 - w_geo) * self.ema_cx
+            self.ema_cy = w_geo * target_center_cy + (1.0 - w_geo) * self.ema_cy
 
         if self.center_cx is None or is_dup:
             self.center_cx = target_center_cx if self.center_cx is None else (0.5 * target_center_cx + 0.5 * self.center_cx)
@@ -1268,6 +1283,7 @@ class UniversalUNetTracker:
         }
         self.frame_idx += 1
         return res
+
 
 
 
