@@ -36,8 +36,23 @@ import json
 import platform
 import sys
 import threading
+import multiprocessing
 import time
 from typing import Callable, Dict, List, Optional, Tuple
+
+# PyInstaller --noconsole (windowed) 模式下 sys.stdout / sys.stderr 为 None，重定向至 devnull 防止 print 崩溃
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="ignore")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="ignore")
+
+
+def get_application_dir() -> str:
+    """获取程序运行目录：兼容 PyInstaller 打包后的单文件 .exe 与普通 .py 脚本"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
 
 import cv2
 import numpy as np
@@ -1946,7 +1961,7 @@ class RegionSelectorOverlay:
 class WinTrackerGUIApp:
     """Windows 实时区域截图 & 视频回放追踪 GUI 主窗口 (V3.0 背景环掩码去自抑制 + 全样本鲁棒锁定 + 全局热键 + 鼠标跟随版)"""
 
-    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_hotkey_config.json")
+    CONFIG_FILE = os.path.join(get_application_dir(), "tracker_hotkey_config.json")
 
     def __init__(
         self,
@@ -2811,4 +2826,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

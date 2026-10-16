@@ -8,6 +8,13 @@ import ctypes
 import json
 import os
 import platform
+import sys
+
+
+def get_application_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 import time
 from typing import List, Optional, Tuple
 import cv2
@@ -85,7 +92,7 @@ class RegionSelectorOverlay:
 class WinTrackerGUIApp:
     """Windows 实时区域截图 & 视频回放追踪 GUI 主窗口 (V3.0 背景环掩码去自抑制 + 全样本鲁棒锁定 + 全局热键 + 鼠标跟随版)"""
 
-    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker_hotkey_config.json")
+    CONFIG_FILE = os.path.join(get_application_dir(), "tracker_hotkey_config.json")
 
     def __init__(
         self,
