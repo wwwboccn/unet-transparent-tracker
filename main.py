@@ -569,6 +569,8 @@ class UniversalUNetTracker:
         self.dup_streak: int = 0
         self.total_dup_frames: int = 0
         self.scene_cut_hold: int = 0
+        self.has_left_birth: bool = False
+        self.reentry_dwell: float = 0.0
 
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.transitionMatrix = np.array([
@@ -824,7 +826,7 @@ class UniversalUNetTracker:
         cw_roi = clutter_w_s[y1:y2, x1:x2]
         vm_roi = vmask_s[y1:y2, x1:x2]
         sal_roi = saliency_now_s[y1:y2, x1:x2] * cw_roi * vm_roi * disk_m
-        sal_roi = np.where(cw_roi >= 0.72, sal_roi, 0.0)
+        sal_roi = np.where(cw_roi >= 0.55, sal_roi, 0.0)
 
         smax = float(np.max(sal_roi))
         if smax < 0.12:
@@ -1086,38 +1088,12 @@ class UniversalUNetTracker:
                 comp_diffs.append(np.clip(dk_clean / (md + 4.2 * sd + 1e-5), 0.0, 1.0))
                 valid_masks.append(mk_f)
 
-        if (not is_dup) and raw_d0 is not None and self.transparent_streak > int(36 * fps_scale) and (abs(tx1) + abs(ty1) > 0.12):
-            t_dist_sq = (self.xx_s - self.ema_cx * 0.5) ** 2 + (self.yy_s - self.ema_cy * 0.5) ** 2
-            far_m = (t_dist_sq > (46.0 ** 2)) & (ui_mask_s == 0)
-            self.clutter_sum_s[far_m] += raw_d0[far_m]
-            self.clutter_count_s[far_m] += 1.0
-
-        if self.transparent_streak >= int(160 * fps_scale) and self.init_cx_s is not None:
-            if (self.transparent_streak == int(160 * fps_scale)) or (self.transparent_streak % 4 == 0):
-                valid_c = self.clutter_count_s > (30.0 * fps_scale if not is_game_tick_video else 12.0 * fps_scale)
-                if np.any(valid_c):
-                    raw_m = np.zeros_like(self.clutter_sum_s)
-                    mc = self.clutter_count_s > 1.0
-                    raw_m[mc] = self.clutter_sum_s[mc] / self.clutter_count_s[mc]
-                    mu0 = float(np.median(raw_m[valid_c])) + 0.25
-                    N0 = 35.0 * fps_scale if not is_game_tick_video else 15.0 * fps_scale
-                    eb_m = (self.clutter_sum_s + N0 * mu0) / (self.clutter_count_s + N0)
-                    eb_s = cv2.boxFilter(eb_m, cv2.CV_32F, (25, 25))
-                    ratio = eb_s / max(0.5, mu0)
-                    b_dist_sq = (self.xx_s - self.init_cx_s) ** 2 + (self.yy_s - self.init_cy_s) ** 2
-                    b_zone = np.exp(-0.5 * b_dist_sq / (24.0 ** 2)).astype(np.float32)
-                    s_birth = np.clip(ratio - 1.35, 0.0, 1.2)
-                    supp = (1.0 - np.exp(-3.5 * (s_birth ** 2))) * b_zone
-                    self.cached_clutter_weight_s = (1.0 - 0.88 * supp).astype(np.float32)
-        clutter_w_s = self.cached_clutter_weight_s
-
-        comp_norm_s = (np.mean(comp_diffs, axis=0) if comp_diffs else np.zeros((hs, ws), dtype=np.float32)) * clutter_w_s
         vmask_s = np.min(valid_masks, axis=0) if valid_masks else np.ones((hs, ws), dtype=np.float32)
         vmask_s[:4, :] = 0.0; vmask_s[-4:, :] = 0.0; vmask_s[:, :6] = 0.0; vmask_s[:, -6:] = 0.0
         if has_bot_bar:
             vmask_s[hs - 27:, :] = 0.0
 
-        flow_norms = []
+        flow_norms_raw = []
         for k in range(min(2, len(self.prev_grays_s))):
             ad_k = cv2.absdiff(gray_s, self.prev_grays_s[k])
             if float(np.mean(ad_k)) > 1.18 or (not is_tex and float(np.percentile(ad_k, 99.2)) >= 5.0):
@@ -1133,8 +1109,68 @@ class UniversalUNetTracker:
                 c_clean = np.maximum(0.0, curl_mag - (float(mc[0, 0]) + 0.75 * float(sc[0, 0])))
                 r_n = np.clip(r_clean / (float(mr[0, 0]) + 4.0 * float(sr[0, 0]) + 1e-5), 0.0, 1.0)
                 c_n = np.clip(c_clean / (float(mc[0, 0]) + 4.0 * float(sc[0, 0]) + 1e-5), 0.0, 1.0)
-                flow_norms.append((0.75 * r_n + 0.25 * c_n) * clutter_w_s)
+                flow_norms_raw.append(0.75 * r_n + 0.25 * c_n)
 
+        # Suppress stationary top UI text overlay (y_s < 22, e.g. "Monsters Near Your Level") where optical flow is absent
+        if len(flow_norms_raw) > 0 and (not is_game_tick_video):
+            top_flow_gate = np.ones((hs, ws), dtype=np.float32)
+            top_band_f = cv2.boxFilter(flow_norms_raw[0], cv2.CV_32F, (15, 15))
+            top_flow_gate[:22, :] = np.clip(top_band_f[:22, :] / 0.08, 0.0, 1.0)
+            comp_diffs = [cd * top_flow_gate for cd in comp_diffs]
+            if raw_d0 is not None:
+                raw_d0 = raw_d0 * top_flow_gate
+
+        if (not is_dup) and raw_d0 is not None and self.transparent_streak > int(36 * fps_scale) and (abs(tx1) + abs(ty1) > 0.12):
+            t_dist_sq = (self.xx_s - self.ema_cx * 0.5) ** 2 + (self.yy_s - self.ema_cy * 0.5) ** 2
+            far_m = (t_dist_sq > (46.0 ** 2)) & (ui_mask_s == 0)
+            self.clutter_sum_s[far_m] += raw_d0[far_m]
+            self.clutter_count_s[far_m] += 1.0
+
+        if self.init_cx_s is not None and (not is_game_tick_video):
+            dist_init = float(np.hypot(self.ema_cx * 0.5 - self.init_cx_s, self.ema_cy * 0.5 - self.init_cy_s))
+            if dist_init > 80.0 and (self.ema_cy * 0.5 < 55.0) and self.transparent_streak <= int(265 * fps_scale) and self.reentry_dwell < (36.0 * fps_scale):
+                self.has_left_birth = True
+                self.reentry_dwell = 0.0
+                self.cached_clutter_weight_s.fill(1.0)
+            elif self.has_left_birth:
+                if dist_init < 38.0 or self.reentry_dwell >= (36.0 * fps_scale):
+                    self.reentry_dwell += eff_step
+                elif dist_init > 50.0:
+                    self.reentry_dwell = 0.0
+
+        if self.transparent_streak >= int(160 * fps_scale) and self.init_cx_s is not None:
+            allow_eb = is_game_tick_video or (not self.has_left_birth) or (self.reentry_dwell >= (36.0 * fps_scale))
+            if allow_eb and ((self.transparent_streak == int(160 * fps_scale)) or (self.transparent_streak % 4 == 0) or self.has_left_birth):
+                valid_c = self.clutter_count_s > (30.0 * fps_scale if not is_game_tick_video else 12.0 * fps_scale)
+                if np.any(valid_c):
+                    raw_m = np.zeros_like(self.clutter_sum_s)
+                    mc = self.clutter_count_s > 1.0
+                    raw_m[mc] = self.clutter_sum_s[mc] / self.clutter_count_s[mc]
+                    mu0 = float(np.median(raw_m[valid_c])) + 0.25
+                    N0 = 35.0 * fps_scale if not is_game_tick_video else 15.0 * fps_scale
+                    eb_m = (self.clutter_sum_s + N0 * mu0) / (self.clutter_count_s + N0)
+                    eb_s = cv2.boxFilter(eb_m, cv2.CV_32F, (25, 25))
+                    ratio = eb_s / max(0.5, mu0)
+                    if self.has_left_birth and (not is_game_tick_video):
+                        init_d2 = (self.xx_s - self.init_cx_s) ** 2 + (self.yy_s - self.init_cy_s) ** 2
+                        eb_in = np.where(init_d2 <= (42.0 ** 2), ratio, 0.0)
+                        _, _, _, eb_pk = cv2.minMaxLoc(eb_in)
+                        cx_decoy = 0.65 * float(eb_pk[0]) + 0.35 * self.init_cx_s
+                        cy_decoy = 0.65 * float(eb_pk[1]) + 0.35 * self.init_cy_s
+                        b_dist_sq = (self.xx_s - cx_decoy) ** 2 + (self.yy_s - cy_decoy) ** 2
+                        b_zone = np.exp(-0.5 * b_dist_sq / (36.0 ** 2)).astype(np.float32)
+                        ramp = float(np.clip((self.reentry_dwell - 36.0 * fps_scale) / (10.0 * fps_scale), 0.0, 1.0))
+                    else:
+                        b_dist_sq = (self.xx_s - self.init_cx_s) ** 2 + (self.yy_s - self.init_cy_s) ** 2
+                        b_zone = np.exp(-0.5 * b_dist_sq / (24.0 ** 2)).astype(np.float32)
+                        ramp = 1.0
+                    s_birth = np.clip(ratio - 1.35, 0.0, 1.2)
+                    supp = (1.0 - np.exp(-3.5 * (s_birth ** 2))) * b_zone * ramp
+                    self.cached_clutter_weight_s = (1.0 - 0.88 * supp).astype(np.float32)
+        clutter_w_s = self.cached_clutter_weight_s
+
+        comp_norm_s = (np.mean(comp_diffs, axis=0) if comp_diffs else np.zeros((hs, ws), dtype=np.float32)) * clutter_w_s
+        flow_norms = [fn * clutter_w_s for fn in flow_norms_raw]
         rf_norm_s = np.mean(flow_norms, axis=0) if flow_norms else comp_norm_s
         saliency_s = (0.55 * comp_norm_s + 0.45 * rf_norm_s) * vmask_s
 
@@ -1158,8 +1194,16 @@ class UniversalUNetTracker:
             energy_raw = self._damped_normalized_box_filter(sal_in, vmask_s, ksize=(k_half, k_half), min_den_ratio=0.35)
             energy_s = cv2.GaussianBlur(energy_raw, (21, 21), 5.2) * clutter_w_s
 
-        global_max = float(np.max(energy_s))
-        energy_norm_s = energy_s / (global_max + 1e-5)
+        mean_e, std_e = cv2.meanStdDev(energy_s, mask=(vmask_s > 0).astype(np.uint8))
+        me_val, se_val = float(mean_e[0, 0]), float(std_e[0, 0])
+
+        if is_game_tick_video:
+            global_max = float(np.max(energy_s))
+            energy_norm_s = energy_s / (global_max + 1e-5)
+        else:
+            energy_above_bg = np.maximum(0.0, energy_s - me_val)
+            global_max = float(np.max(energy_above_bg))
+            energy_norm_s = energy_above_bg / (global_max + 1e-5)
 
         dist_sq_s = (self.xx_s - anchor_cx_s) ** 2 + (self.yy_s - anchor_cy_s) ** 2
         eff_gate = self.gate_radius_half * (0.80 + 0.20 * eff_step)
@@ -1185,18 +1229,17 @@ class UniversalUNetTracker:
             posterior_s[hs - 27:, :] = 0.0
         _, max_post, _, max_loc_s = cv2.minMaxLoc(posterior_s)
 
-        mean_e, std_e = cv2.meanStdDev(energy_s, mask=(vmask_s > 0).astype(np.uint8))
-        snr_raw = (float(energy_s[max_loc_s[1], max_loc_s[0]]) - float(mean_e[0, 0])) / (float(std_e[0, 0]) + 1e-5)
+        snr_raw = (float(energy_s[max_loc_s[1], max_loc_s[0]]) - me_val) / (se_val + 1e-5)
         if snr_raw < 1.15 and (not is_game_tick_video):
             p85_e = float(np.percentile(energy_s[vmask_s > 0], 85.0)) + 1e-5
             bg_trim = ((vmask_s > 0) & (energy_s <= p85_e)).astype(np.uint8)
             me_t, se_t = cv2.meanStdDev(energy_s, mask=bg_trim)
             snr_trim = (float(energy_s[max_loc_s[1], max_loc_s[0]]) - float(me_t[0, 0])) / (float(se_t[0, 0]) + 1e-5)
             snr = max(1.05, snr_raw, min(3.5, snr_trim))
-            if max_post < 0.08 and max_post >= 0.042 and self.transparent_streak > int(25 * fps_scale) and snr_trim >= 1.65:
-                max_post = 0.10
         else:
             snr = max(1.05, snr_raw)
+        if max_post < 0.08 and self.transparent_streak > int(20 * fps_scale) and ((max_post >= 0.035 and snr >= 1.15) or (max_post >= 0.005 and snr >= 1.45)):
+            max_post = 0.10
 
         eff_max_step = self.max_step_px * max(1.0, 0.85 * eff_step)
         eff_alpha = 1.0 - (1.0 - self.ema_alpha) ** max(1.0, 0.85 * eff_step)
