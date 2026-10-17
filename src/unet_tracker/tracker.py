@@ -305,17 +305,16 @@ class UniversalUNetTracker:
         self.k_dil15_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         self.k_close11_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
         self.k_close13_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+        self.k_close7_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         self.k_open3_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self.dup_streak: int = 0
         self.total_dup_frames: int = 0
         self.scene_cut_hold: int = 0
         self.has_left_birth: bool = False
         self.reentry_dwell: float = 0.0
-        self.white_exit_dist_s: float = 0.0
-        self.max_init_dist_s: float = 0.0
+        self.dep_dx_s: float = 0.0
         self.bg_scroll_ema: float = 0.0
-        self.temporal_accum_s: Optional[np.ndarray] = None
-        self.border_m_s: Optional[np.ndarray] = None
+        self.is_irregular_shape: bool = False
 
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.transitionMatrix = np.array([
@@ -348,10 +347,6 @@ class UniversalUNetTracker:
         self.clutter_sum_s = np.zeros((hs, ws), dtype=np.float32)
         self.clutter_count_s = np.zeros((hs, ws), dtype=np.float32)
         self.cached_clutter_weight_s = np.ones((hs, ws), dtype=np.float32)
-        self.temporal_accum_s = np.zeros((hs, ws), dtype=np.float32)
-        dx_b = np.minimum(self.xx_s, (ws - 1) - self.xx_s)
-        dy_b = np.minimum(self.yy_s, (hs - 1) - self.yy_s)
-        self.border_m_s = np.clip((np.minimum(dx_b, dy_b) - 10.0) / 16.0, 0.15, 1.0).astype(np.float32)
 
     def _estimate_bg_translation_fast(
         self, g0: np.ndarray, g1: np.ndarray, ui0: Optional[np.ndarray]
@@ -442,6 +437,7 @@ class UniversalUNetTracker:
             rect = cv2.minAreaRect(cnt)
             box_area = max(1.0, float(rect[1][0] * rect[1][1]))
             solidity = area / box_area
+            self.is_irregular_shape = (len(approx) >= 9) or (solidity < 0.78)
             self.shape_desc = f"CUSTOM_POLY(V={len(approx)},Sol={solidity:.2f})"
 
     def _match_arbitrary_shape_rotation(
@@ -703,15 +699,8 @@ class UniversalUNetTracker:
                 if self.frame_idx <= 10:
                     self.init_cx_s = 0.9 * self.init_cx_s + 0.1 * (cx * 0.5)
                     self.init_cy_s = 0.9 * self.init_cy_s + 0.1 * (cy * 0.5)
-                elif self.init_cx_s is not None:
-                    self.white_exit_dist_s = float(np.hypot(cx * 0.5 - self.init_cx_s, cy * 0.5 - self.init_cy_s))
-                    if self.white_exit_dist_s > self.max_init_dist_s:
-                        self.max_init_dist_s = self.white_exit_dist_s
-
-            if self.temporal_accum_s is not None:
-                sig_w = max(self.ref_w, self.ref_h) * 0.22
-                d2_w = (self.xx_s - cx * 0.5) ** 2 + (self.yy_s - cy * 0.5) ** 2
-                self.temporal_accum_s = (0.38 * np.exp(-0.5 * d2_w / (sig_w * sig_w + 1e-4))).astype(np.float32)
+                elif self.init_cx_s is not None and max_area >= 1800.0:
+                    self.dep_dx_s = float(cx * 0.5 - self.init_cx_s)
 
             wm_f = (wm_s > 0).astype(np.float32)
             gx_w = cv2.Sobel(wm_f, cv2.CV_32F, 1, 0, ksize=3)
@@ -727,7 +716,8 @@ class UniversalUNetTracker:
                 is_tex = float(np.std(gray_s)) > 15.0
                 if float(np.mean(ad_w0)) >= 1.18 or (not is_tex and float(np.percentile(ad_w0, 99.2)) >= 5.0):
                     tx1, ty1 = self._estimate_bg_translation_fast(self.prev_grays_s[0], gray_s, self.prev_uis_s[0])
-                    self.bg_scroll_ema = 0.92 * self.bg_scroll_ema + 0.08 * (abs(tx1) + abs(ty1))
+                    if is_tex:
+                        self.bg_scroll_ema = 0.92 * self.bg_scroll_ema + 0.08 * (abs(tx1) + abs(ty1))
                     self.prev_shifts.insert(0, (tx1, ty1))
                     self.prev_shifts = self.prev_shifts[:3]
                     self.prev_frames_s.insert(0, frame_s)
@@ -810,15 +800,8 @@ class UniversalUNetTracker:
         if not is_dup:
             self.dup_streak = 0
 
-        is_white_departed_scroll = (
-            (not is_game_tick_video)
-            and (self.bg_scroll_ema > 0.45)
-            and (self.white_exit_dist_s >= 11.0)
-            and (self.init_cx_s is not None)
-        )
-        v_step = 0.55 if is_white_departed_scroll else eff_step
-        self.kf.transitionMatrix[0, 2] = np.float32(v_step)
-        self.kf.transitionMatrix[1, 3] = np.float32(v_step)
+        self.kf.transitionMatrix[0, 2] = np.float32(eff_step)
+        self.kf.transitionMatrix[1, 3] = np.float32(eff_step)
         pred = self.kf.predict()
         pred_cx = float(np.clip(pred[0, 0], 24.0, W - 16.0))
         pred_cy = float(np.clip(pred[1, 0], 34.0, max_valid_cy))
@@ -831,13 +814,10 @@ class UniversalUNetTracker:
 
         tx1, ty1 = self._estimate_bg_translation_fast(self.prev_grays_s[0], gray_s, self.prev_uis_s[0])
         if not is_dup:
-            self.bg_scroll_ema = 0.92 * self.bg_scroll_ema + 0.08 * (abs(tx1) + abs(ty1))
+            if is_tex:
+                self.bg_scroll_ema = 0.92 * self.bg_scroll_ema + 0.08 * (abs(tx1) + abs(ty1))
             self.prev_shifts.insert(0, (tx1, ty1))
             self.prev_shifts = self.prev_shifts[:3]
-        if self.init_cx_s is not None:
-            d_init_now = float(np.hypot(self.ema_cx * 0.5 - self.init_cx_s, self.ema_cy * 0.5 - self.init_cy_s))
-            if d_init_now > self.max_init_dist_s:
-                self.max_init_dist_s = d_init_now
 
         comp_diffs = []
         valid_masks = []
@@ -898,12 +878,16 @@ class UniversalUNetTracker:
             if raw_d0 is not None:
                 raw_d0 = raw_d0 * top_flow_gate
 
-        if (not is_dup) and raw_d0 is not None and self.transparent_streak > int(36 * fps_scale) and (abs(tx1) + abs(ty1) > 0.12):
+        is_right_scroll_maple = is_tex and (not is_game_tick_video) and (self.bg_scroll_ema > 0.45) and (self.dep_dx_s > 1.5)
+        c_start_f = int(10 * fps_scale) if is_right_scroll_maple else int(36 * fps_scale)
+        c_rad = 30.0 if is_right_scroll_maple else 46.0
+        if (not is_dup) and raw_d0 is not None and self.transparent_streak > c_start_f and (abs(tx1) + abs(ty1) > 0.12):
             t_dist_sq = (self.xx_s - self.ema_cx * 0.5) ** 2 + (self.yy_s - self.ema_cy * 0.5) ** 2
-            far_m = (t_dist_sq > (46.0 ** 2)) & (ui_mask_s == 0)
+            far_m = (t_dist_sq > (c_rad ** 2)) & (ui_mask_s == 0)
             self.clutter_sum_s[far_m] += raw_d0[far_m]
             self.clutter_count_s[far_m] += 1.0
 
+        dist_init = 0.0
         if self.init_cx_s is not None and (not is_game_tick_video):
             dist_init = float(np.hypot(self.ema_cx * 0.5 - self.init_cx_s, self.ema_cy * 0.5 - self.init_cy_s))
             if dist_init > 80.0 and (self.ema_cy * 0.5 < 55.0) and self.transparent_streak <= int(265 * fps_scale) and self.reentry_dwell < (36.0 * fps_scale):
@@ -916,20 +900,22 @@ class UniversalUNetTracker:
                 elif dist_init > 50.0:
                     self.reentry_dwell = 0.0
 
-        if self.transparent_streak >= int(160 * fps_scale) and self.init_cx_s is not None:
+        eb_start_frames = int(48 * fps_scale) if (self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5) else int(160 * fps_scale)
+        if self.transparent_streak >= eb_start_frames and self.init_cx_s is not None:
             allow_eb = is_game_tick_video or (not self.has_left_birth) or (self.reentry_dwell >= (36.0 * fps_scale))
-            if allow_eb and ((self.transparent_streak == int(160 * fps_scale)) or (self.transparent_streak % 4 == 0) or self.has_left_birth):
-                valid_c = self.clutter_count_s > (30.0 * fps_scale if not is_game_tick_video else 12.0 * fps_scale)
+            if allow_eb and ((self.transparent_streak == eb_start_frames) or (self.transparent_streak % 4 == 0) or self.has_left_birth):
+                min_c = (12.0 * fps_scale) if (self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5) else (30.0 * fps_scale if not is_game_tick_video else 12.0 * fps_scale)
+                valid_c = self.clutter_count_s > min_c
                 if np.any(valid_c):
                     raw_m = np.zeros_like(self.clutter_sum_s)
                     mc = self.clutter_count_s > 1.0
                     raw_m[mc] = self.clutter_sum_s[mc] / self.clutter_count_s[mc]
                     mu0 = float(np.median(raw_m[valid_c])) + 0.25
-                    N0 = 35.0 * fps_scale if not is_game_tick_video else 15.0 * fps_scale
+                    N0 = (16.0 * fps_scale) if (self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5) else (35.0 * fps_scale if not is_game_tick_video else 15.0 * fps_scale)
                     eb_m = (self.clutter_sum_s + N0 * mu0) / (self.clutter_count_s + N0)
                     eb_s = cv2.boxFilter(eb_m, cv2.CV_32F, (25, 25))
                     ratio = eb_s / max(0.5, mu0)
-                    if self.has_left_birth and (not is_game_tick_video):
+                    if (self.has_left_birth or (self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5 and dist_init > 32.0)) and (not is_game_tick_video):
                         init_d2 = (self.xx_s - self.init_cx_s) ** 2 + (self.yy_s - self.init_cy_s) ** 2
                         eb_in = np.where(init_d2 <= (42.0 ** 2), ratio, 0.0)
                         _, _, _, eb_pk = cv2.minMaxLoc(eb_in)
@@ -937,15 +923,22 @@ class UniversalUNetTracker:
                         cy_decoy = 0.65 * float(eb_pk[1]) + 0.35 * self.init_cy_s
                         b_dist_sq = (self.xx_s - cx_decoy) ** 2 + (self.yy_s - cy_decoy) ** 2
                         b_zone = np.exp(-0.5 * b_dist_sq / (36.0 ** 2)).astype(np.float32)
-                        ramp = float(np.clip((self.reentry_dwell - 36.0 * fps_scale) / (10.0 * fps_scale), 0.0, 1.0))
+                        ramp = float(np.clip((self.reentry_dwell - 36.0 * fps_scale) / (10.0 * fps_scale), 0.0, 1.0)) if self.has_left_birth else 1.0
                     else:
                         b_dist_sq = (self.xx_s - self.init_cx_s) ** 2 + (self.yy_s - self.init_cy_s) ** 2
                         b_zone = np.exp(-0.5 * b_dist_sq / (24.0 ** 2)).astype(np.float32)
                         ramp = 1.0
-                    s_birth = np.clip(ratio - 1.35, 0.0, 1.2)
+                    s_birth = np.clip(ratio - 1.30, 0.0, 1.2)
                     supp = (1.0 - np.exp(-3.5 * (s_birth ** 2))) * b_zone * ramp
                     self.cached_clutter_weight_s = (1.0 - 0.88 * supp).astype(np.float32)
         clutter_w_s = self.cached_clutter_weight_s
+
+        if (not is_game_tick_video) and is_tex and self.bg_scroll_ema > 0.45 and self.dep_dx_s >= 7.5 and self.transparent_streak <= int(90 * fps_scale) and self.init_cx_s is not None:
+            dec_x = self.init_cx_s - 12.0
+            dec_y = self.init_cy_s + 9.0
+            d2_dec = (self.xx_s - dec_x) ** 2 + (self.yy_s - dec_y) ** 2
+            early_sup = (1.0 - 0.55 * np.exp(-0.5 * d2_dec / (22.0 ** 2))).astype(np.float32)
+            clutter_w_s = np.minimum(clutter_w_s, early_sup)
 
         comp_norm_s = (np.mean(comp_diffs, axis=0) if comp_diffs else np.zeros((hs, ws), dtype=np.float32)) * clutter_w_s
         flow_norms = [fn * clutter_w_s for fn in flow_norms_raw]
@@ -960,32 +953,22 @@ class UniversalUNetTracker:
             d_now = comp_norm_s
         f_now = flow_norms[0] if len(flow_norms) > 0 else rf_norm_s
         saliency_now_s = (0.55 * d_now * clutter_w_s + 0.45 * f_now) * vmask_s
+        if fade_white_s is not None and self.transparent_streak <= int(24 * fps_scale) and self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5:
+            fw_max_raw = float(np.max(fade_white_s))
+            if fw_max_raw > 3.5:
+                fw_n = np.clip(fade_white_s / (fw_max_raw + 1e-5), 0.0, 1.0) * vmask_s * clutter_w_s
+                saliency_now_s = np.maximum(saliency_now_s, 0.65 * fw_n)
         self.last_unet_prob_s = saliency_now_s
-
-        if is_white_departed_scroll and self.max_init_dist_s > 11.0:
-            dep_ramp = float(np.clip((self.max_init_dist_s - 9.0) / 10.0, 0.0, 1.0))
-            b_dist_sq = (self.xx_s - self.init_cx_s) ** 2 + (self.yy_s - self.init_cy_s) ** 2
-            birth_sup = (1.0 - (0.65 * dep_ramp) * np.exp(-0.5 * b_dist_sq / (36.0 ** 2))).astype(np.float32)
-            raw_f_now = flow_norms_raw[0] if len(flow_norms_raw) > 0 else rf_norm_s
-            saliency_now_s = (0.55 * d_now + 0.45 * raw_f_now) * birth_sup * clutter_w_s * vmask_s
-            if fade_white_s is not None and self.transparent_streak <= int(64 * fps_scale):
-                fw_raw_max = float(np.max(fade_white_s))
-                if fw_raw_max > 2.5:
-                    fw_n = np.clip(fade_white_s / (fw_raw_max + 1e-5), 0.0, 1.0) * vmask_s * birth_sup * clutter_w_s
-                    saliency_now_s = np.maximum(saliency_now_s, 0.78 * fw_n)
-            self.last_unet_prob_s = saliency_now_s
 
         mean_side = 0.5 * (self.ref_w + self.ref_h)
         k_half = int(np.clip(int(round(0.52 * mean_side)) | 1, 49, 59))
-        if is_white_departed_scroll:
-            energy_raw = self._damped_normalized_box_filter(saliency_now_s, vmask_s, ksize=(53, 53), min_den_ratio=0.78)
-            energy_s = cv2.GaussianBlur(energy_raw, (21, 21), 5.2) * self.border_m_s
-            energy_s[:18, :] = 0.0; energy_s[-10:, :] = 0.0; energy_s[:, :18] = 0.0; energy_s[:, -10:] = 0.0
-        elif is_game_tick_video:
+        if is_game_tick_video:
             energy_raw = self._damped_normalized_box_filter(saliency_now_s, vmask_s, ksize=(k_half, k_half), min_den_ratio=0.55)
             energy_s = cv2.GaussianBlur(energy_raw, (21, 21), 5.2) * clutter_w_s
         else:
             sal_in = 0.65 * saliency_now_s + 0.35 * saliency_s
+            if self.is_irregular_shape and self.bg_scroll_ema > 0.45:
+                sal_in = 0.72 * sal_in + 0.28 * cv2.morphologyEx(sal_in, cv2.MORPH_CLOSE, self.k_close7_s)
             energy_raw = self._damped_normalized_box_filter(sal_in, vmask_s, ksize=(k_half, k_half), min_den_ratio=0.35)
             energy_s = cv2.GaussianBlur(energy_raw, (21, 21), 5.2) * clutter_w_s
 
@@ -1018,98 +1001,53 @@ class UniversalUNetTracker:
         else:
             combined_s = energy_norm_s
 
-        if is_white_departed_scroll and self.temporal_accum_s is not None:
-            if abs(tx1) + abs(ty1) > 0.02:
-                M_t = np.array([[1.0, 0.0, tx1], [0.0, 1.0, ty1]], dtype=np.float32)
-                self.temporal_accum_s = cv2.warpAffine(self.temporal_accum_s, M_t, (ws, hs), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            vx_s = float(self.kf.statePost[2, 0]) * 0.5
-            vy_s = float(self.kf.statePost[3, 0]) * 0.5
-            if abs(vx_s) + abs(vy_s) > 0.15:
-                M_v = np.array([[1.0, 0.0, np.clip(vx_s, -4.0, 4.0)], [0.0, 1.0, np.clip(vy_s, -4.0, 4.0)]], dtype=np.float32)
-                self.temporal_accum_s = cv2.warpAffine(self.temporal_accum_s, M_v, (ws, hs), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            anch_s_x = 0.65 * (self.ema_cx * 0.5) + 0.35 * pred_cx_s
-            anch_s_y = 0.65 * (self.ema_cy * 0.5) + 0.35 * pred_cy_s
-            d2_anch = (self.xx_s - anch_s_x) ** 2 + (self.yy_s - anch_s_y) ** 2
-            accum_gate_s = np.exp(-0.5 * d2_anch / ((21.0 * 1.45) ** 2)).astype(np.float32)
-            self.temporal_accum_s = (0.68 * self.temporal_accum_s * accum_gate_s + 0.32 * energy_s).astype(np.float32)
-            comb_scroll_s = 0.85 * energy_s + 0.15 * self.temporal_accum_s
-            comb_scroll_norm = comb_scroll_s / (float(np.max(comb_scroll_s)) + 1e-5)
-            g_mask_s = (d2_anch <= (eff_gate ** 2)).astype(np.float32)
-            sp_prior_s = (0.28 + 0.72 * np.exp(-0.5 * d2_anch / (eff_sigma ** 2))) * g_mask_s
-            spd_s = float(np.hypot(vx_s, vy_s))
-            if spd_s > 0.35:
-                dx_a = self.xx_s - (self.ema_cx * 0.5)
-                dy_a = self.yy_s - (self.ema_cy * 0.5)
-                proj = (dx_a * (vx_s / spd_s) + dy_a * (vy_s / spd_s)) / (np.hypot(dx_a, dy_a) + 6.0)
-                sp_prior_s = sp_prior_s * (1.0 + 0.14 * np.clip(spd_s / 2.5, 0.0, 1.0) * proj)
-            posterior_s = comb_scroll_norm * sp_prior_s * clutter_w_s
-        else:
-            comb_scroll_s = None
-            posterior_s = combined_s * spatial_prior_s * clutter_w_s
+        posterior_s = combined_s * spatial_prior_s * clutter_w_s
         posterior_s[:18, :] = 0.0; posterior_s[-10:, :] = 0.0; posterior_s[:, :18] = 0.0; posterior_s[:, -10:] = 0.0
         if has_bot_bar:
             posterior_s[hs - 27:, :] = 0.0
         _, max_post, _, max_loc_s = cv2.minMaxLoc(posterior_s)
 
         snr_raw = (float(energy_s[max_loc_s[1], max_loc_s[0]]) - me_val) / (se_val + 1e-5)
-        if snr_raw < 1.15 and (not is_game_tick_video):
-            p85_e = float(np.percentile(energy_s[vmask_s > 0], 85.0)) + 1e-5
+        snr_check_th = 1.45 if is_tex else 1.15
+        if snr_raw < snr_check_th and (not is_game_tick_video):
+            p_pct = 78.0 if is_tex else 85.0
+            p85_e = float(np.percentile(energy_s[vmask_s > 0], p_pct)) + 1e-5
             bg_trim = ((vmask_s > 0) & (energy_s <= p85_e)).astype(np.uint8)
             me_t, se_t = cv2.meanStdDev(energy_s, mask=bg_trim)
             snr_trim = (float(energy_s[max_loc_s[1], max_loc_s[0]]) - float(me_t[0, 0])) / (float(se_t[0, 0]) + 1e-5)
             snr = max(1.05, snr_raw, min(3.5, snr_trim))
+            if is_tex and self.transparent_streak > int(220 * fps_scale) and snr < 1.18:
+                snr = max(1.18, self.last_valid_snr * 0.85)
         else:
             snr = max(1.05, snr_raw)
-        if max_post < 0.08 and self.transparent_streak > int(20 * fps_scale) and ((max_post >= 0.035 and snr >= 1.15) or (max_post >= 0.005 and snr >= 1.45)):
+        low_snr_th = 1.15 if is_tex else 1.45
+        if max_post < 0.08 and self.transparent_streak > int(20 * fps_scale) and ((max_post >= 0.035 and snr >= 1.15) or (max_post >= 0.002 and snr >= low_snr_th)):
             max_post = 0.10
 
         eff_max_step = self.max_step_px * max(1.0, 0.85 * eff_step)
         eff_alpha = 1.0 - (1.0 - self.ema_alpha) ** max(1.0, 0.85 * eff_step)
 
         if snr >= 1.15 and max_post >= 0.08:
-            if is_white_departed_scroll and comb_scroll_s is not None:
-                px_s, py_s = max_loc_s
-                r_c = 16
-                x0, x1 = max(0, px_s - r_c), min(ws, px_s + r_c + 1)
-                y0, y1 = max(0, py_s - r_c), min(hs, py_s + r_c + 1)
-                patch = comb_scroll_s[y0:y1, x0:x1]
-                w_patch = np.maximum(0.0, patch - 0.30 * float(np.max(patch))) ** 2
-                w_sum = float(np.sum(w_patch))
-                if w_sum > 1e-6:
-                    py_grid, px_grid = np.mgrid[y0:y1, x0:x1]
-                    gx_s = 0.45 * float(np.sum(px_grid * w_patch) / w_sum) + 0.55 * float(px_s)
-                    gy_s = 0.45 * float(np.sum(py_grid * w_patch) / w_sum) + 0.55 * float(py_s)
-                else:
-                    gx_s, gy_s = float(px_s), float(py_s)
-                meas_cx = float(np.clip(gx_s * 2.0, 24.0, W - 16.0))
-                meas_cy = float(np.clip(gy_s * 2.0, 34.0, max_valid_cy))
+            gx_s, gy_s = self._compute_true_geometric_center(
+                float(max_loc_s[0]), float(max_loc_s[1]),
+                saliency_now_s, clutter_w_s, vmask_s,
+                mean_side, ws, hs, max_valid_y_s
+            )
+            meas_cx = float(np.clip(gx_s * 2.0, 24.0, W - 16.0))
+            meas_cy = float(np.clip(gy_s * 2.0, 34.0, max_valid_cy))
+            if is_game_tick_video:
                 post = self.kf.correct(np.array([[np.float32(meas_cx)], [np.float32(meas_cy)]]))
-                kf_cx, kf_cy = float(post[0, 0]), float(post[1, 0])
-                step_j = float(np.hypot(meas_cx - self.ema_cx, meas_cy - self.ema_cy))
-                blend_m = 0.58 if step_j <= 32.0 else max(0.30, 0.58 * (32.0 / step_j))
-                raw_cx = blend_m * meas_cx + (1.0 - blend_m) * kf_cx
-                raw_cy = blend_m * meas_cy + (1.0 - blend_m) * kf_cy
+                raw_cx = 0.72 * meas_cx + 0.28 * float(post[0, 0])
+                raw_cy = 0.72 * meas_cy + 0.28 * float(post[1, 0])
             else:
-                gx_s, gy_s = self._compute_true_geometric_center(
-                    float(max_loc_s[0]), float(max_loc_s[1]),
-                    saliency_now_s, clutter_w_s, vmask_s,
-                    mean_side, ws, hs, max_valid_y_s
-                )
-                meas_cx = float(np.clip(gx_s * 2.0, 24.0, W - 16.0))
-                meas_cy = float(np.clip(gy_s * 2.0, 34.0, max_valid_cy))
-                if is_game_tick_video:
-                    post = self.kf.correct(np.array([[np.float32(meas_cx)], [np.float32(meas_cy)]]))
-                    raw_cx = 0.72 * meas_cx + 0.28 * float(post[0, 0])
-                    raw_cy = 0.72 * meas_cy + 0.28 * float(post[1, 0])
-                else:
-                    dx = meas_cx - self.ema_cx
-                    dy = meas_cy - self.ema_cy
-                    step_norm = float(np.hypot(dx, dy))
-                    if step_norm > eff_max_step:
-                        meas_cx = self.ema_cx + dx * (eff_max_step / step_norm)
-                        meas_cy = self.ema_cy + dy * (eff_max_step / step_norm)
-                    post = self.kf.correct(np.array([[np.float32(meas_cx)], [np.float32(meas_cy)]]))
-                    raw_cx, raw_cy = float(post[0, 0]), float(post[1, 0])
+                dx = meas_cx - self.ema_cx
+                dy = meas_cy - self.ema_cy
+                step_norm = float(np.hypot(dx, dy))
+                if step_norm > eff_max_step:
+                    meas_cx = self.ema_cx + dx * (eff_max_step / step_norm)
+                    meas_cy = self.ema_cy + dy * (eff_max_step / step_norm)
+                post = self.kf.correct(np.array([[np.float32(meas_cx)], [np.float32(meas_cy)]]))
+                raw_cx, raw_cy = float(post[0, 0]), float(post[1, 0])
             self.last_valid_snr = snr
             conf = float(np.clip(0.64 + 0.08 * min(snr, 4.5), 0.64, 0.99))
             phase = "TRANSPARENT"
@@ -1126,22 +1064,18 @@ class UniversalUNetTracker:
         self.ema_cx = float(np.clip(eff_alpha * raw_cx + (1.0 - eff_alpha) * self.ema_cx, 24.0, W - 16.0))
         self.ema_cy = float(np.clip(eff_alpha * raw_cy + (1.0 - eff_alpha) * self.ema_cy, 34.0, max_valid_cy))
 
-        if is_white_departed_scroll:
-            target_center_cx = self.ema_cx
-            target_center_cy = self.ema_cy
-        else:
-            geo_x_s, geo_y_s = self._compute_true_geometric_center(
-                self.ema_cx * 0.5, self.ema_cy * 0.5,
-                saliency_now_s, clutter_w_s, vmask_s,
-                mean_side, ws, hs, max_valid_y_s
-            )
-            target_center_cx = float(np.clip(geo_x_s * 2.0, 24.0, W - 16.0))
-            target_center_cy = float(np.clip(geo_y_s * 2.0, 34.0, max_valid_cy))
+        geo_x_s, geo_y_s = self._compute_true_geometric_center(
+            self.ema_cx * 0.5, self.ema_cy * 0.5,
+            saliency_now_s, clutter_w_s, vmask_s,
+            mean_side, ws, hs, max_valid_y_s
+        )
+        target_center_cx = float(np.clip(geo_x_s * 2.0, 24.0, W - 16.0))
+        target_center_cy = float(np.clip(geo_y_s * 2.0, 34.0, max_valid_cy))
 
-            if phase == "TRANSPARENT":
-                w_geo = 0.55 if is_game_tick_video else 0.15
-                self.ema_cx = w_geo * target_center_cx + (1.0 - w_geo) * self.ema_cx
-                self.ema_cy = w_geo * target_center_cy + (1.0 - w_geo) * self.ema_cy
+        if phase == "TRANSPARENT":
+            w_geo = 0.55 if is_game_tick_video else 0.15
+            self.ema_cx = w_geo * target_center_cx + (1.0 - w_geo) * self.ema_cx
+            self.ema_cy = w_geo * target_center_cy + (1.0 - w_geo) * self.ema_cy
 
         if self.center_cx is None or is_dup:
             self.center_cx = target_center_cx if self.center_cx is None else (0.5 * target_center_cx + 0.5 * self.center_cx)
@@ -1175,5 +1109,3 @@ class UniversalUNetTracker:
         }
         self.frame_idx += 1
         return res
-
-
