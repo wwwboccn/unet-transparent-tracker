@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Windows 桌面可视化 GUI 操作台 (V3.0 支持本地 CUDA / 远程 WebSocket & HTTP 算力一键切换 + 全局热键 + 鼠标自动跟随)。
+Windows 桌面可视化 GUI 操作台 (V3.7: 带垂直滚动条控制面板 + 实时控制台连接日志 + 本地 CUDA / FRP 远程算力切换 + 全局热键 + 鼠标跟随)。
 """
 
 import ctypes
@@ -9,23 +8,25 @@ import json
 import os
 import platform
 import sys
-
-
-def get_application_dir() -> str:
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
 
 from .capture import ScreenRegionCapturer
 from .hotkeys import SystemGlobalHotkeyManager
-from .mouse_controller import ScreenMouseController
-from .remote import RemoteTrackerClient
+from .mouse import ScreenMouseController
+from .overlay import draw_unet_overlay
+from .remote import RemoteTrackerClient, APP_VERSION
 from .tracker import UniversalUNetTracker
-from .visualizer import draw_unet_overlay
+
+
+def get_application_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ==============================================================================
 # 6. Windows 桌面可视化 GUI 界面 (集成系统全局可配置快捷键 + 鼠标自动跟随中心点)
@@ -90,7 +91,7 @@ class RegionSelectorOverlay:
 
 
 class WinTrackerGUIApp:
-    """Windows 实时区域截图 & 视频回放追踪 GUI 主窗口 (V3.0 背景环掩码去自抑制 + 全样本鲁棒锁定 + 全局热键 + 鼠标跟随版)"""
+    """Windows 实时区域截图 & 视频回放追踪 GUI 主窗口 (V3.7: 可滚动控制面板 + 实时控制台连接日志 + FRP 8765->38765 穿透增强 + 全样本100%鲁棒锁定)"""
 
     CONFIG_FILE = os.path.join(get_application_dir(), "tracker_hotkey_config.json")
 
@@ -117,8 +118,9 @@ class WinTrackerGUIApp:
                     pass
 
         self.root = tk.Tk()
-        self.root.title("U-Net 全图形自适应透明目标实时追踪系统 V3.0 (全样本100%鲁棒锁定 + 全局热键 + 鼠标跟随版)")
-        self.root.geometry("1280x830")
+        self.root.title(f"U-Net 全图形自适应透明目标实时追踪系统 {APP_VERSION} (FRP远程算力诊断 + 全样本100%锁定 + 全局热键 + 鼠标跟随版)")
+        self.root.geometry("1320x860")
+        self.root.minsize(980, 620)
         self.root.configure(bg="#141820")
 
         self.compute_device = device
@@ -127,13 +129,14 @@ class WinTrackerGUIApp:
         self.hk_toggle_run = "F8"
         self.hk_toggle_mouse = "F9"
         self.hk_panic_stop = "F10"
+        self.log_text_widget = None
         self._load_user_config()
 
         self.local_tracker = UniversalUNetTracker(
             fps=30.0, perf_mode="ultra", device=(self.compute_device if self.compute_device != "remote" else "auto"), gpu_id=self.gpu_id
         )
         self.remote_tracker = RemoteTrackerClient(
-            server_url=self.remote_url, fps=30.0, perf_mode="ultra"
+            server_url=self.remote_url, fps=30.0, perf_mode="ultra", log_callback=self._append_gui_log
         )
         self.tracker = self.remote_tracker if self.compute_device == "remote" else self.local_tracker
         self.capturer = ScreenRegionCapturer()
@@ -163,8 +166,55 @@ class WinTrackerGUIApp:
         self.hotkey_mgr.start()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._append_gui_log(f"[{time.strftime('%H:%M:%S')}] [System] U-Net 实时追踪系统 {APP_VERSION} GUI 已启动 (控制台与日志框同步输出)")
+        self._append_gui_log(f"[{time.strftime('%H:%M:%S')}] [System] 本地加速硬件: {self.local_tracker.cuda_backend.device_name}")
+
         if initial_video and os.path.exists(initial_video):
             self._load_video_source(initial_video)
+
+    def _append_gui_log(self, line: str) -> None:
+        """线程安全地将连接与错误日志追加到 GUI 底部日志框 (同时控制台已由 _log 打印)"""
+        if self.log_text_widget is None:
+            return
+
+        def _do_append():
+            try:
+                self.log_text_widget.configure(state="normal")
+                self.log_text_widget.insert("end", line.rstrip("\r\n") + "\n")
+                # 限制最大行数防止内存增长
+                num_lines = int(self.log_text_widget.index("end-1c").split(".")[0])
+                if num_lines > 250:
+                    self.log_text_widget.delete("1.0", f"{num_lines - 200}.0")
+                self.log_text_widget.see("end")
+                self.log_text_widget.configure(state="disabled")
+            except Exception:
+                pass
+
+        try:
+            self.root.after(0, _do_append)
+        except Exception:
+            pass
+
+    def _clear_gui_log(self) -> None:
+        if self.log_text_widget is None:
+            return
+        try:
+            self.log_text_widget.configure(state="normal")
+            self.log_text_widget.delete("1.0", "end")
+            self.log_text_widget.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _copy_gui_log(self) -> None:
+        if self.log_text_widget is None:
+            return
+        try:
+            txt = self.log_text_widget.get("1.0", "end").strip()
+            self.root.clipboard_clear()
+            self.root.clipboard_append(txt)
+            self._append_gui_log(f"[{time.strftime('%H:%M:%S')}] [GUI] ✅ 已将日志复制到系统剪贴板!")
+        except Exception:
+            pass
 
     def _load_user_config(self) -> None:
         try:
@@ -186,6 +236,7 @@ class WinTrackerGUIApp:
     def _save_user_config(self) -> None:
         try:
             cfg = {
+                "version": APP_VERSION,
                 "hk_toggle_run": self.hk_toggle_run,
                 "hk_toggle_mouse": self.hk_toggle_mouse,
                 "hk_panic_stop": self.hk_panic_stop,
@@ -208,12 +259,55 @@ class WinTrackerGUIApp:
         self.preview_canvas = tk.Canvas(left_frame, bg="#090B10", highlightthickness=0)
         self.preview_canvas.pack(fill="both", expand=True)
 
-        right_frame = tk.Frame(self.root, bg="#1C222D", width=395)
-        right_frame.pack(side="right", fill="y", padx=(0, 10), pady=10)
-        right_frame.pack_propagate(False)
+        # 右侧带垂直滚动条 (Scrollbar + Canvas + 鼠标滚轮支持) 的控制面板容器
+        right_container = tk.Frame(self.root, bg="#1C222D", width=425)
+        right_container.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        right_container.pack_propagate(False)
+
+        self.right_scrollbar = ttk.Scrollbar(right_container, orient="vertical")
+        self.right_scrollbar.pack(side="right", fill="y")
+
+        self.right_scroll_canvas = tk.Canvas(
+            right_container,
+            bg="#1C222D",
+            highlightthickness=0,
+            bd=0,
+            yscrollcommand=self.right_scrollbar.set,
+        )
+        self.right_scroll_canvas.pack(side="left", fill="both", expand=True)
+        self.right_scrollbar.config(command=self.right_scroll_canvas.yview)
+
+        right_frame = tk.Frame(self.right_scroll_canvas, bg="#1C222D")
+        self._right_frame_win_id = self.right_scroll_canvas.create_window((0, 0), window=right_frame, anchor="nw")
+
+        def _on_right_frame_configure(_event=None):
+            self.right_scroll_canvas.configure(scrollregion=self.right_scroll_canvas.bbox("all"))
+
+        def _on_right_canvas_configure(event):
+            self.right_scroll_canvas.itemconfig(self._right_frame_win_id, width=event.width)
+
+        right_frame.bind("<Configure>", _on_right_frame_configure)
+        self.right_scroll_canvas.bind("<Configure>", _on_right_canvas_configure)
+
+        # 绑定鼠标滚轮事件 (兼容 Windows / macOS / Linux)
+        def _on_mousewheel(event):
+            try:
+                if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                    self.right_scroll_canvas.yview_scroll(-1, "units")
+                elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+                    self.right_scroll_canvas.yview_scroll(1, "units")
+            except Exception:
+                pass
+
+        def _bind_wheel_recursive(widget):
+            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+            widget.bind("<Button-4>", _on_mousewheel, add="+")
+            widget.bind("<Button-5>", _on_mousewheel, add="+")
+            for child in widget.winfo_children():
+                _bind_wheel_recursive(child)
 
         title_lbl = tk.Label(
-            right_frame, text="⚡ U-Net 实时追踪 & 鼠标锁定控制面板 V3.0",
+            right_frame, text=f"⚡ U-Net 实时追踪 & 鼠标锁定控制面板 {APP_VERSION}",
             bg="#1C222D", fg="#00E5FF", font=("Microsoft YaHei", 11, "bold")
         )
         title_lbl.pack(pady=(6, 4))
@@ -221,7 +315,7 @@ class WinTrackerGUIApp:
         btn_style = {"font": ("Microsoft YaHei", 9, "bold"), "bd": 0, "pady": 5, "cursor": "hand2"}
 
         top_btn_row = tk.Frame(right_frame, bg="#1C222D")
-        top_btn_row.pack(fill="x", padx=12, pady=2)
+        top_btn_row.pack(fill="x", padx=10, pady=2)
         self.btn_snip = tk.Button(
             top_btn_row, text="📷 1. 框选屏幕区域",
             bg="#00B894", fg="white", command=self.start_screen_snip, **btn_style
@@ -235,7 +329,7 @@ class WinTrackerGUIApp:
         self.btn_video.pack(side="right", expand=True, fill="x", padx=(3, 0))
 
         ctrl_row = tk.Frame(right_frame, bg="#1C222D")
-        ctrl_row.pack(fill="x", padx=12, pady=2)
+        ctrl_row.pack(fill="x", padx=10, pady=2)
 
         self.btn_toggle = tk.Button(
             ctrl_row, text=f"▶ 开始追踪 ({self.hk_toggle_run})", bg="#FD9644", fg="white",
@@ -253,7 +347,7 @@ class WinTrackerGUIApp:
             right_frame, text="⌨️ 系统全局快捷键配置 (后台/游戏内均可响应)",
             bg="#1C222D", fg="#00CEC9", font=("Microsoft YaHei", 9, "bold"), padx=8, pady=4
         )
-        hk_box.pack(fill="x", padx=12, pady=3)
+        hk_box.pack(fill="x", padx=10, pady=3)
 
         self.var_hk_run = tk.StringVar(value=self.hk_toggle_run)
         self.var_hk_mouse = tk.StringVar(value=self.hk_toggle_mouse)
@@ -280,7 +374,7 @@ class WinTrackerGUIApp:
             right_frame, text="🖱️ 鼠标自动移动到追踪中心点控制",
             bg="#1C222D", fg="#FD79A8", font=("Microsoft YaHei", 9, "bold"), padx=8, pady=4
         )
-        mouse_box.pack(fill="x", padx=12, pady=3)
+        mouse_box.pack(fill="x", padx=10, pady=3)
 
         self.var_mouse_follow = tk.BooleanVar(value=False)
         self.chk_mouse_follow = tk.Checkbutton(
@@ -342,10 +436,10 @@ class WinTrackerGUIApp:
         self.spin_off_y.pack(side="left", padx=2)
 
         clock_box = tk.LabelFrame(
-            right_frame, text="⏱️ 时钟同步与显卡硬件加速 (RTX 3060 12G CUDA / CPU)",
+            right_frame, text="⏱️ 时钟同步与算力源 (本地 CUDA / FRP 远程算力)",
             bg="#1C222D", fg="#00FFCC", font=("Microsoft YaHei", 9, "bold"), padx=8, pady=3
         )
-        clock_box.pack(fill="x", padx=12, pady=3)
+        clock_box.pack(fill="x", padx=10, pady=3)
 
         self.var_wall_clock = tk.BooleanVar(value=True)
         tk.Checkbutton(
@@ -378,7 +472,7 @@ class WinTrackerGUIApp:
         self.var_remote_url = tk.StringVar(value=self.remote_url)
         self.entry_remote = tk.Entry(
             rem_row, textvariable=self.var_remote_url, bg="#0D1017", fg="#00E5FF",
-            insertbackground="white", font=("Consolas", 8), width=26
+            insertbackground="white", font=("Consolas", 8), width=24
         )
         self.entry_remote.pack(side="left", padx=3, fill="x", expand=True)
         self.btn_ping_remote = tk.Button(
@@ -422,7 +516,7 @@ class WinTrackerGUIApp:
             right_frame, text="📊 实时追踪参数与屏幕鼠标坐标",
             bg="#1C222D", fg="#74B9FF", font=("Microsoft YaHei", 9, "bold"), padx=8, pady=3
         )
-        telemetry_box.pack(fill="x", padx=12, pady=3)
+        telemetry_box.pack(fill="x", padx=10, pady=3)
 
         self.telemetry_vars = {}
         fields = [
@@ -454,11 +548,47 @@ class WinTrackerGUIApp:
             right_frame, text="⚙️ 运动学基准参数 (随真实时钟自动缩放)",
             bg="#1C222D", fg="#FDCB6E", font=("Microsoft YaHei", 9, "bold"), padx=8, pady=2
         )
-        param_box.pack(fill="x", padx=12, pady=2)
+        param_box.pack(fill="x", padx=10, pady=2)
 
         self.slider_ema = self._add_slider(param_box, "EMA 平滑系数 (α):", 0.20, 0.85, 0.50, 0.02)
         self.slider_gate = self._add_slider(param_box, "半分辨率门控半径 (px):", 28.0, 68.0, 44.0, 2.0)
         self.slider_step = self._add_slider(param_box, "单帧基准最大步长 (px):", 12.0, 40.0, 21.0, 1.0)
+
+        # 底部实时连接与控制台错误日志面板 (同步输出到系统控制台 stdout)
+        log_box = tk.LabelFrame(
+            right_frame, text="📜 远程连接与控制台实时日志 (同步输出至终端控制台)",
+            bg="#1C222D", fg="#81ECEC", font=("Microsoft YaHei", 9, "bold"), padx=6, pady=4
+        )
+        log_box.pack(fill="x", padx=10, pady=(4, 10))
+
+        log_btn_row = tk.Frame(log_box, bg="#1C222D")
+        log_btn_row.pack(fill="x", pady=(0, 3))
+        tk.Button(
+            log_btn_row, text="📋 复制全部日志", bg="#2D3436", fg="#55EFC4",
+            font=("Microsoft YaHei", 8, "bold"), bd=1, relief="solid", cursor="hand2",
+            command=self._copy_gui_log
+        ).pack(side="left", padx=(0, 4))
+        tk.Button(
+            log_btn_row, text="🗑️ 清空日志", bg="#2D3436", fg="#FAB1A0",
+            font=("Microsoft YaHei", 8), bd=1, relief="solid", cursor="hand2",
+            command=self._clear_gui_log
+        ).pack(side="left")
+
+        log_txt_frame = tk.Frame(log_box, bg="#0D1017")
+        log_txt_frame.pack(fill="x")
+        log_scroll = ttk.Scrollbar(log_txt_frame, orient="vertical")
+        log_scroll.pack(side="right", fill="y")
+        self.log_text_widget = tk.Text(
+            log_txt_frame, height=8, bg="#090B10", fg="#55EFC4",
+            insertbackground="white", font=("Consolas", 8), wrap="word",
+            yscrollcommand=log_scroll.set, state="disabled", bd=1, relief="sunken"
+        )
+        self.log_text_widget.pack(side="left", fill="both", expand=True)
+        log_scroll.config(command=self.log_text_widget.yview)
+
+        _bind_wheel_recursive(right_frame)
+        # 避免在日志框内滚动时触发外层面板滚动冲突
+        self.log_text_widget.unbind("<MouseWheel>")
 
     def _build_hotkey_row(self, parent, label_txt: str, text_var, rec_cmd):
         tk = self.tk
@@ -564,34 +694,44 @@ class WinTrackerGUIApp:
     def _test_remote_connection(self) -> None:
         url = self.var_remote_url.get().strip()
         self.remote_url = url
-        self.remote_tracker.set_server_url(url)
-        ok, msg, _ = self.remote_tracker.ping_health()
-        if ok:
-            self.var_device.set("remote")
-            self.compute_device = "remote"
-            self.tracker = self.remote_tracker
-            self.btn_ping_remote.config(text="✅已连通", bg="#00B894")
-        else:
-            self.btn_ping_remote.config(text="❌失败", bg="#D63031")
+        self.btn_ping_remote.config(text="⏳连接中...", bg="#FD9644")
         if "device" in self.telemetry_vars:
-            self.telemetry_vars["device"].set(msg)
-        self._save_user_config()
+            self.telemetry_vars["device"].set(f"正在连接 {url} ...")
+        self.root.update_idletasks()
+
+        def _bg_ping():
+            self.remote_tracker.set_server_url(url)
+            ok, msg, _ = self.remote_tracker.ping_health()
+
+            def _ui_done():
+                if ok:
+                    self.var_device.set("remote")
+                    self.compute_device = "remote"
+                    self.tracker = self.remote_tracker
+                    self.btn_ping_remote.config(text="✅已连通", bg="#00B894")
+                else:
+                    self.btn_ping_remote.config(text="❌失败(看日志)", bg="#D63031")
+                if "device" in self.telemetry_vars:
+                    self.telemetry_vars["device"].set(msg[:54])
+                self._save_user_config()
+
+            self.root.after(0, _ui_done)
+
+        threading.Thread(target=_bg_ping, daemon=True).start()
 
     def _on_device_change(self) -> None:
         dev = self.var_device.get()
         self.compute_device = dev
         self.remote_url = self.var_remote_url.get().strip()
         if dev == "remote":
-            self.remote_tracker.set_server_url(self.remote_url)
             self.tracker = self.remote_tracker
-            ok, msg, _ = self.remote_tracker.ping_health()
-            dev_str = msg if ok else f"远程待连接 ({self.remote_url})"
+            self._test_remote_connection()
         else:
             self.tracker = self.local_tracker
             dev_str = self.local_tracker.set_device(dev, gpu_id=self.gpu_id)
-        if "device" in self.telemetry_vars:
-            self.telemetry_vars["device"].set(dev_str)
-        self._save_user_config()
+            if "device" in self.telemetry_vars:
+                self.telemetry_vars["device"].set(dev_str)
+            self._save_user_config()
 
     def _on_param_change(self) -> None:
         self.tracker.perf_mode = self.var_perf_mode.get()
@@ -796,7 +936,7 @@ class WinTrackerGUIApp:
         fps_val = 1000.0 / max(0.5, state["latency_ms"])
         m_status = "跟随中" if mouse_moved else "待机"
         if "device" in state:
-            self.telemetry_vars["device"].set(str(state["device"])[:34])
+            self.telemetry_vars["device"].set(str(state["device"])[:54])
         self.telemetry_vars["phase"].set(f"{state['phase']} | {state['shape'][:14]}")
         self.telemetry_vars["pos"].set(f"({state['cx']:5.1f}, {state['cy']:5.1f})")
         self.telemetry_vars["screen_pos"].set(f"({screen_xy[0]}, {screen_xy[1]}) [{m_status}]")

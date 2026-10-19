@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-命令行视频追踪推理、远程算力服务端启动與 GUI 入口 (V3.0)。
+命令行视频追踪推理、远程算力服务端启动與 GUI 入口 (V3.7)。
 """
 
 import argparse
@@ -97,7 +97,7 @@ def process_video_cli(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="全图形自适应 U-Net 透明目标追踪系统 V3.0 (远程算力 HTTP/WebSocket + RTX 3060/T4 CUDA 加速 + 精度优先 Ultra + 全局热键 + 鼠标跟随版)"
+        description="全图形自适应 U-Net 透明目标追踪系统 V3.7 (远程算力 HTTP/WebSocket + RTX 3060/T4 CUDA 加速 + 精度优先 Ultra + 全局热键 + 鼠标跟随版)"
     )
     parser.add_argument("--gui", action="store_true", help="启动 Windows 可视化 GUI 操作台 (支持本地与远程算力一键切换)")
     parser.add_argument("--server", action="store_true", help="启动远程 GPU 算力服务端 (同时监听 HTTP 与 WebSocket)")

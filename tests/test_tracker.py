@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V3.0 自动化单元测试：验证全局快捷键解析、鼠标控制器、合成透明旋转目标的几何中心锁定以及 WebSocket/HTTP 远程算力客户端导入。
+V3.7 自动化单元测试：验证全局快捷键解析、鼠标控制器、合成透明旋转目标的几何中心锁定以及 WebSocket/HTTP 远程算力客户端导入。
 运行方式: python -m unittest discover -s tests
 """
 
@@ -24,9 +24,9 @@ from unet_tracker import (
 )
 
 
-class TestUNetTrackerProjectV30(unittest.TestCase):
+class TestUNetTrackerProjectV37(unittest.TestCase):
     def test_version_and_cuda_backend(self):
-        self.assertEqual(__version__, "3.0.0")
+        self.assertEqual(__version__, "3.7.0")
         backend = CudaAcceleratorBackend(device_pref="cpu")
         self.assertFalse(backend.is_cuda_active)
 

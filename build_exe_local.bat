@@ -6,5 +6,5 @@ echo ===========================================================================
 python -m pip install -r requirements.txt pyinstaller
 python scripts/build_windows_exe.py
 echo.
-echo 打包完成！请查看 dist\UNetTracker_V3.0_Portable 文件夹。
+echo 打包完成！请查看 dist\UNetTracker_V3.7_Portable 文件夹。
 pause

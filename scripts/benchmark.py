@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V3.0 多视频自动化基准评测脚本：测试 Ultra 精度优先模式 (支持 --device cuda / auto / cpu)。
+V3.7 多视频自动化基准评测脚本：测试 Ultra 精度优先模式 (支持 --device cuda / auto / cpu)。
 用法: python scripts/benchmark.py video1.mp4 video2.mp4 ...
 """
 
@@ -14,7 +14,7 @@ from unet_tracker.cli import process_video_cli
 
 
 def run_benchmarks(video_paths):
-    print("=== 1. V3.0 Ultra 几何中心锁定全帧推理基准测试 ===")
+    print("=== 1. V3.7 Ultra 几何中心锁定全帧推理基准测试 ===")
     for vp in video_paths:
         process_video_cli(vp, perf_mode="ultra", device="auto")
 
