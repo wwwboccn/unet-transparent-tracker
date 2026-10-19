@@ -114,7 +114,7 @@ def main() -> None:
     with open(os.path.join(portable_dir, "2_Start_Remote_Server_8765.bat"), "w", encoding="utf-8") as f:
         f.write(
             "@echo off\nchcp 65001 >nul\n"
-            "echo Starting U-Net V3.0 Remote GPU Server on port 8765...\n"
+            "echo Starting U-Net V3.6 Remote GPU Server on dual ports 8765 and 38765 (IPv4 + IPv6)...\n"
             "\"%~dp0UNetTracker_V3.0_Server_CLI.exe\" --server --host 0.0.0.0 --port 8765 --device auto --mode ultra\n"
             "pause\n"
         )

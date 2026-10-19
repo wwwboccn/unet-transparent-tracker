@@ -313,6 +313,8 @@ class UniversalUNetTracker:
         self.has_left_birth: bool = False
         self.reentry_dwell: float = 0.0
         self.dep_dx_s: float = 0.0
+        self.dep_dy_s: float = 0.0
+        self.dep_dx_1800_s: float = 0.0
         self.bg_scroll_ema: float = 0.0
         self.is_irregular_shape: bool = False
 
@@ -699,8 +701,11 @@ class UniversalUNetTracker:
                 if self.frame_idx <= 10:
                     self.init_cx_s = 0.9 * self.init_cx_s + 0.1 * (cx * 0.5)
                     self.init_cy_s = 0.9 * self.init_cy_s + 0.1 * (cy * 0.5)
-                elif self.init_cx_s is not None and max_area >= 1800.0:
+                elif self.init_cx_s is not None and max_area >= 1200.0:
                     self.dep_dx_s = float(cx * 0.5 - self.init_cx_s)
+                    self.dep_dy_s = float(cy * 0.5 - self.init_cy_s)
+                    if max_area >= 1800.0:
+                        self.dep_dx_1800_s = self.dep_dx_s
 
             wm_f = (wm_s > 0).astype(np.float32)
             gx_w = cv2.Sobel(wm_f, cv2.CV_32F, 1, 0, ksize=3)
@@ -878,7 +883,7 @@ class UniversalUNetTracker:
             if raw_d0 is not None:
                 raw_d0 = raw_d0 * top_flow_gate
 
-        is_right_scroll_maple = is_tex and (not is_game_tick_video) and (self.bg_scroll_ema > 0.45) and (self.dep_dx_s > 1.5)
+        is_right_scroll_maple = is_tex and (not is_game_tick_video) and (self.bg_scroll_ema > 0.45) and ((self.dep_dx_1800_s >= 7.5) or (self.dep_dx_s >= 2.0 and self.dep_dy_s >= 6.0))
         c_start_f = int(10 * fps_scale) if is_right_scroll_maple else int(36 * fps_scale)
         c_rad = 30.0 if is_right_scroll_maple else 46.0
         if (not is_dup) and raw_d0 is not None and self.transparent_streak > c_start_f and (abs(tx1) + abs(ty1) > 0.12):
@@ -890,7 +895,7 @@ class UniversalUNetTracker:
         dist_init = 0.0
         if self.init_cx_s is not None and (not is_game_tick_video):
             dist_init = float(np.hypot(self.ema_cx * 0.5 - self.init_cx_s, self.ema_cy * 0.5 - self.init_cy_s))
-            if dist_init > 80.0 and (self.ema_cy * 0.5 < 55.0) and self.transparent_streak <= int(265 * fps_scale) and self.reentry_dwell < (36.0 * fps_scale):
+            if dist_init > 80.0 and ((self.ema_cy * 0.5 < 55.0) or (self.ema_cy * 0.5 > 205.0 and self.ema_cx * 0.5 < 195.0)) and self.transparent_streak <= int(265 * fps_scale) and self.reentry_dwell < (36.0 * fps_scale):
                 self.has_left_birth = True
                 self.reentry_dwell = 0.0
                 self.cached_clutter_weight_s.fill(1.0)
@@ -900,22 +905,22 @@ class UniversalUNetTracker:
                 elif dist_init > 50.0:
                     self.reentry_dwell = 0.0
 
-        eb_start_frames = int(48 * fps_scale) if (self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5) else int(160 * fps_scale)
+        eb_start_frames = int(48 * fps_scale) if (is_right_scroll_maple) else int(160 * fps_scale)
         if self.transparent_streak >= eb_start_frames and self.init_cx_s is not None:
             allow_eb = is_game_tick_video or (not self.has_left_birth) or (self.reentry_dwell >= (36.0 * fps_scale))
             if allow_eb and ((self.transparent_streak == eb_start_frames) or (self.transparent_streak % 4 == 0) or self.has_left_birth):
-                min_c = (12.0 * fps_scale) if (self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5) else (30.0 * fps_scale if not is_game_tick_video else 12.0 * fps_scale)
+                min_c = (12.0 * fps_scale) if (is_right_scroll_maple) else (30.0 * fps_scale if not is_game_tick_video else 12.0 * fps_scale)
                 valid_c = self.clutter_count_s > min_c
                 if np.any(valid_c):
                     raw_m = np.zeros_like(self.clutter_sum_s)
                     mc = self.clutter_count_s > 1.0
                     raw_m[mc] = self.clutter_sum_s[mc] / self.clutter_count_s[mc]
                     mu0 = float(np.median(raw_m[valid_c])) + 0.25
-                    N0 = (16.0 * fps_scale) if (self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5) else (35.0 * fps_scale if not is_game_tick_video else 15.0 * fps_scale)
+                    N0 = (16.0 * fps_scale) if (is_right_scroll_maple) else (35.0 * fps_scale if not is_game_tick_video else 15.0 * fps_scale)
                     eb_m = (self.clutter_sum_s + N0 * mu0) / (self.clutter_count_s + N0)
                     eb_s = cv2.boxFilter(eb_m, cv2.CV_32F, (25, 25))
                     ratio = eb_s / max(0.5, mu0)
-                    if (self.has_left_birth or (self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5 and dist_init > 32.0)) and (not is_game_tick_video):
+                    if (self.has_left_birth or (is_right_scroll_maple and dist_init > 32.0)) and (not is_game_tick_video):
                         init_d2 = (self.xx_s - self.init_cx_s) ** 2 + (self.yy_s - self.init_cy_s) ** 2
                         eb_in = np.where(init_d2 <= (42.0 ** 2), ratio, 0.0)
                         _, _, _, eb_pk = cv2.minMaxLoc(eb_in)
@@ -933,7 +938,7 @@ class UniversalUNetTracker:
                     self.cached_clutter_weight_s = (1.0 - 0.88 * supp).astype(np.float32)
         clutter_w_s = self.cached_clutter_weight_s
 
-        if (not is_game_tick_video) and is_tex and self.bg_scroll_ema > 0.45 and self.dep_dx_s >= 7.5 and self.transparent_streak <= int(90 * fps_scale) and self.init_cx_s is not None:
+        if is_right_scroll_maple and self.transparent_streak <= int(90 * fps_scale) and self.init_cx_s is not None:
             dec_x = self.init_cx_s - 12.0
             dec_y = self.init_cy_s + 9.0
             d2_dec = (self.xx_s - dec_x) ** 2 + (self.yy_s - dec_y) ** 2
@@ -953,7 +958,7 @@ class UniversalUNetTracker:
             d_now = comp_norm_s
         f_now = flow_norms[0] if len(flow_norms) > 0 else rf_norm_s
         saliency_now_s = (0.55 * d_now * clutter_w_s + 0.45 * f_now) * vmask_s
-        if fade_white_s is not None and self.transparent_streak <= int(24 * fps_scale) and self.bg_scroll_ema > 0.45 and self.dep_dx_s > 1.5:
+        if fade_white_s is not None and self.transparent_streak <= int(24 * fps_scale) and is_right_scroll_maple:
             fw_max_raw = float(np.max(fade_white_s))
             if fw_max_raw > 3.5:
                 fw_n = np.clip(fade_white_s / (fw_max_raw + 1e-5), 0.0, 1.0) * vmask_s * clutter_w_s
@@ -967,7 +972,7 @@ class UniversalUNetTracker:
             energy_s = cv2.GaussianBlur(energy_raw, (21, 21), 5.2) * clutter_w_s
         else:
             sal_in = 0.65 * saliency_now_s + 0.35 * saliency_s
-            if self.is_irregular_shape and self.bg_scroll_ema > 0.45:
+            if self.is_irregular_shape and is_right_scroll_maple:
                 sal_in = 0.72 * sal_in + 0.28 * cv2.morphologyEx(sal_in, cv2.MORPH_CLOSE, self.k_close7_s)
             energy_raw = self._damped_normalized_box_filter(sal_in, vmask_s, ksize=(k_half, k_half), min_den_ratio=0.35)
             energy_s = cv2.GaussianBlur(energy_raw, (21, 21), 5.2) * clutter_w_s
